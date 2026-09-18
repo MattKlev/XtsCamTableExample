@@ -1,0 +1,35 @@
+<?xml version="1.0" encoding="utf-8"?>
+<TcPlcObject Version="1.1.0.1">
+  <POU Name="F_CamPoint" Id="{efabc417-894e-431f-bc01-b6b4ea477b9e}" SpecialFunc="None">
+    <Declaration><![CDATA[// Builds one point of the motion-function cam table.
+//
+// Every point is a "velocity point" with slave velocity 1.0 (slave moves 1 mm per 1 mm of master)
+// and acceleration 0. That is what a 1:1 relation with a fixed gap looks like.
+//
+// eFuncToNext is the curve type used from THIS point to the NEXT point:
+//   MOTIONFUNCTYPE_POLYNOM1    - straight line   -> gap stays constant (1:1)
+//   MOTIONFUNCTYPE_POLYNOM5_MM - 5th order poly  -> gap changes smoothly (motion -> motion)
+//
+// The slave position is written as "master minus gap", i.e. Mover 2 runs BEHIND Mover 1.
+FUNCTION F_CamPoint : MC_MotionFunctionPoint
+VAR_INPUT
+	nIndex		: UDINT;				// 1..n, no gaps
+	fMasterPos	: LREAL;				// position of Mover 1 (mm on the track)
+	fGap		: LREAL;				// how far Mover 2 is behind Mover 1 at this master position (mm)
+	eFuncToNext	: MC_MotionFunctionType;	// curve type towards the next point
+END_VAR
+]]></Declaration>
+    <Implementation>
+      <ST><![CDATA[F_CamPoint.PointIndex		:= nIndex;
+F_CamPoint.FunctionType		:= eFuncToNext;
+F_CamPoint.PointType		:= MOTIONPOINTTYPE_VELOCITY;	// velocity is given, acceleration is 0
+F_CamPoint.RelIndexNextPoint	:= 1;		// next point is index+1 (MAIN sets 0 on the last point)
+F_CamPoint.MasterPos		:= fMasterPos;
+F_CamPoint.SlavePos			:= fMasterPos - fGap;
+F_CamPoint.SlaveVelo		:= 1.0;		// dSlave/dMaster = 1 -> both movers travel at the same speed here
+F_CamPoint.SlaveAcc			:= 0.0;
+F_CamPoint.SlaveJerk		:= 0.0;
+]]></ST>
+    </Implementation>
+  </POU>
+</TcPlcObject>
