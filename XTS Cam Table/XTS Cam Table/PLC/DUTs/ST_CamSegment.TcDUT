@@ -1,0 +1,13 @@
+<?xml version="1.0" encoding="utf-8"?>
+<TcPlcObject Version="1.1.0.1">
+  <DUT Name="ST_CamSegment" Id="{2f32282f-5481-481e-920e-f309184867d8}">
+    <Declaration><![CDATA[// One entry of the track layout handed to FB_XtsCamStitcher (StitchedSegments example)
+TYPE ST_CamSegment :
+STRUCT
+	eKind	: E_SegmentKind;	// Straight or Curve
+	fLength	: LREAL;			// [mm] length along the mover path (a curve module: MODULE_LENGTH, 500)
+END_STRUCT
+END_TYPE
+]]></Declaration>
+  </DUT>
+</TcPlcObject>

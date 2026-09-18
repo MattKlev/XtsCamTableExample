@@ -1,0 +1,114 @@
+﻿<?xml version="1.0" encoding="utf-8"?>
+<TcPlcObject Version="1.1.0.1">
+  <POU Name="FB_XtsCamStitcher" Id="{7a6cfbae-48c0-49d1-a43c-431d11e7efad}" SpecialFunc="None">
+    <Declaration><![CDATA[FUNCTION_BLOCK FB_XtsCamStitcher
+(* Stitches a cam table (MC_MotionFunctionPoint array) for one lap of an XTS track out of segments:
+     Straight - the cam runs 1:1 (slave = master - fStraightGap). Contributes no point of its own.
+     Curve    - one 180 deg module, pasted from a module-relative point list: master AND slave measured from the
+                module start, gap already included (e.g. the 8 inner points of PRG_Example3.aCurvePoints).
+   The layout must start and end on a straight, and every straight after a curve must be longer than the curve
+   points reach past the module end (103 mm with the default clothoid knots). Otherwise the master positions stop
+   increasing and Build() reports an error. All SlaveVelo/SlaveAcc/SlaveJerk = 0, as in FB_XtsBallCamBuilder. *)
+VAR CONSTANT
+	MAX_SEGMENTS	: UINT := 8;
+END_VAR
+VAR_INPUT
+	aLayout			: ARRAY[1..MAX_SEGMENTS] OF ST_CamSegment;	// the track, segment by segment, starting at fMasterStart
+	nSegments		: UINT;					// entries of aLayout in use
+	fMasterStart	: LREAL;				// [mm] master position of the first table point (must lie on a straight)
+	fStraightGap	: LREAL;				// [mm] the slave trails the master by this much on a straight
+	pCurvePoints	: POINTER TO MC_MotionFunctionPoint;	// module-relative points of ONE curve module
+	nCurvePoints	: UDINT;				// number of those points
+	pPoints			: POINTER TO MC_MotionFunctionPoint;	// target buffer: ADR(camPoints[first element])
+	nMaxPoints		: UDINT;				// number of elements in the target buffer
+END_VAR
+VAR_OUTPUT
+	nPoints			: UDINT;				// points written (use as NoOfRows)
+	fLength			: LREAL;				// [mm] sum of the segment lengths = master range of the table
+	bError			: BOOL;
+	sError			: STRING(255);
+END_VAR]]></Declaration>
+    <Implementation>
+      <ST><![CDATA[(* nothing cyclic: call Build() once *)]]></ST>
+    </Implementation>
+    <Method Name="AddPoint" Id="{7518fc10-bcfc-465f-b3f6-c84118c852ee}">
+      <Declaration><![CDATA[METHOD PRIVATE AddPoint
+VAR_INPUT
+	fMaster	: LREAL;
+	fSlave	: LREAL;
+	eFunc	: MC_MotionFunctionType;
+END_VAR]]></Declaration>
+      <Implementation>
+        <ST><![CDATA[IF bError THEN RETURN; END_IF
+IF nPoints >= nMaxPoints THEN
+	bError := TRUE; sError := 'point buffer too small'; RETURN;
+END_IF
+IF nPoints > 0 AND_THEN fMaster <= pPoints[nPoints - 1].MasterPos THEN
+	bError := TRUE;
+	sError := CONCAT('master positions not increasing at point ', UDINT_TO_STRING(nPoints + 1));
+	sError := CONCAT(sError, ' (a straight shorter than the curve overhang?)');
+	RETURN;
+END_IF
+
+pPoints[nPoints].PointIndex        := nPoints + 1;
+pPoints[nPoints].MasterPos         := fMaster;
+pPoints[nPoints].SlavePos          := fSlave;
+pPoints[nPoints].FunctionType      := eFunc;
+pPoints[nPoints].PointType         := SEL(nPoints = 0, MC_MotionPointType.MOTIONPOINTTYPE_MOTION, MC_MotionPointType.MOTIONPOINTTYPE_ACTIVATION);
+pPoints[nPoints].RelIndexNextPoint := 1;
+pPoints[nPoints].SlaveVelo         := 0.0;
+pPoints[nPoints].SlaveAcc          := 0.0;
+pPoints[nPoints].SlaveJerk         := 0.0;
+nPoints := nPoints + 1;]]></ST>
+      </Implementation>
+    </Method>
+    <Method Name="Build" Id="{788ee3f9-9530-4459-82c3-ebc7d07c6801}">
+      <Declaration><![CDATA[METHOD Build : BOOL
+VAR
+	i	: UINT;
+	k	: UDINT;
+	fM	: LREAL;	// master position where the current segment starts
+END_VAR]]></Declaration>
+      <Implementation>
+        <ST><![CDATA[bError := FALSE; sError := ''; nPoints := 0; fLength := 0.0;
+
+IF pPoints = 0 OR nMaxPoints < 2 THEN
+	bError := TRUE; sError := 'pPoints / nMaxPoints not set'; RETURN;
+END_IF
+IF nSegments < 1 OR nSegments > MAX_SEGMENTS THEN
+	bError := TRUE; sError := 'nSegments must be 1..8'; RETURN;
+END_IF
+IF aLayout[1].eKind <> E_SegmentKind.Straight OR aLayout[nSegments].eKind <> E_SegmentKind.Straight THEN
+	bError := TRUE; sError := 'layout must start and end on a straight'; RETURN;
+END_IF
+
+// first point: on a straight, 1:1 line towards whatever comes next
+fM := fMasterStart;
+AddPoint(fM, fM - fStraightGap, MC_MotionFunctionType.MOTIONFUNCTYPE_POLYNOM1);
+
+FOR i := 1 TO nSegments DO
+	IF aLayout[i].eKind = E_SegmentKind.Curve THEN
+		IF pCurvePoints = 0 OR nCurvePoints = 0 THEN
+			bError := TRUE; sError := 'pCurvePoints / nCurvePoints not set'; RETURN;
+		END_IF
+		// paste the module: shift master and slave by the module start, keep the curve types
+		FOR k := 0 TO nCurvePoints - 1 DO
+			AddPoint(fM + pCurvePoints[k].MasterPos, fM + pCurvePoints[k].SlavePos, pCurvePoints[k].FunctionType);
+		END_FOR
+	END_IF
+	// a straight adds nothing: the line from the previous point simply continues 1:1
+	fM := fM + aLayout[i].fLength;
+END_FOR
+fLength := fM - fMasterStart;
+
+// last point: back on a straight
+AddPoint(fM, fM - fStraightGap, MC_MotionFunctionType.MOTIONFUNCTYPE_POLYNOM1);
+
+IF NOT bError THEN
+	pPoints[nPoints - 1].RelIndexNextPoint := 0;	// terminate the table
+END_IF
+Build := NOT bError;]]></ST>
+      </Implementation>
+    </Method>
+  </POU>
+</TcPlcObject>

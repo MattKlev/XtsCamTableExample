@@ -1,13 +1,18 @@
-<?xml version="1.0" encoding="utf-8"?>
+﻿<?xml version="1.0" encoding="utf-8"?>
 <TcPlcObject Version="1.1.0.1">
   <DUT Name="E_Example" Id="{840659f7-54af-4a4a-b0c6-fb5596a318ae}">
-    <Declaration><![CDATA[// Which cam table MAIN builds. Pick one in the online view (MAIN.eExample) before bStart.
+    <Declaration><![CDATA[// Which example program MAIN calls. Pick one in the online view (MAIN.eExample), then start it from that program.
 TYPE E_Example :
 (
-	ConstantGap,		// 9 points: Mover 2 a fixed distance behind Mover 1, 100 mm on the straights / 60 mm in the curves
-						// (MAIN.BuildTable_ConstantGap, F_CamPoint)
-	ClothoidBallGap		// 18 points: each mover carries a ball outboard of the track, the balls keep a constant distance
-						// along the ball path through the curve transitions (MAIN.BuildTable_Clothoid, FB_XtsBallCamBuilder)
+	ConstantGap,		// PRG_Example1: 9 points, Mover 2 a fixed distance behind Mover 1, 100 mm on the straights /
+						// 60 mm in the curves (F_CamPoint)
+	ClothoidBallGap,	// PRG_Example2: 18 points, the two movers pinch a ball between them like tongs and keep their
+						// jaws a constant distance apart along the ball's path through the curve transitions
+						// (FB_XtsBallCamBuilder)
+	StitchedSegments,	// PRG_Example3: the same 18 points, assembled from a track layout and ONE module-relative
+						// clothoid piece (FB_XtsCamStitcher)
+	TwoTableSwitching	// PRG_Example4: two NC tables, a 2-point straight line and the 10-point clothoid piece. The NC
+						// swaps them at the curve boundaries while running
 );
 END_TYPE
 ]]></Declaration>

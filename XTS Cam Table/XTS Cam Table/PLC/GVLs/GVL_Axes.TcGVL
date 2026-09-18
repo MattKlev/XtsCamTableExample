@@ -1,0 +1,14 @@
+﻿<?xml version="1.0" encoding="utf-8"?>
+<TcPlcObject Version="1.1.0.1">
+  <GVL Name="GVL_Axes" Id="{f2998c09-e5ec-4fea-b68e-7229b173fd76}">
+    <Declaration><![CDATA[// The two movers, shared by all examples (linked to NC axes "Mover Axis 1" / "Mover Axis 2").
+
+// Only one example program runs at a time, see MAIN.
+{attribute 'qualified_only'}
+VAR_GLOBAL
+	Mover1		  : AXIS_REF; // master
+	Mover2		  : AXIS_REF; // slave
+	VirtualMaster : AXIS_REF; // Virtual master
+END_VAR]]></Declaration>
+  </GVL>
+</TcPlcObject>

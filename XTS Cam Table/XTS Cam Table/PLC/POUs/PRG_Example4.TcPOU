@@ -1,0 +1,444 @@
+﻿<?xml version="1.0" encoding="utf-8"?>
+<TcPlcObject Version="1.1.0.1">
+  <POU Name="PRG_Example4" Id="{37a0d8c1-a3be-417f-a47d-3f69a52d0385}" SpecialFunc="None">
+    <Declaration><![CDATA[// Example 4 - TwoTableSwitching: TWO cam tables that the NC swaps at the curve boundaries while running.
+//
+//   Mover 1 = master, runs at constant velocity around the track.
+//   Mover 2 = slave, follows Mover 1 through whichever table is active.
+//
+// Table 1 (CAM_TABLE_ID)   = a 2-point straight line, Mover 2 BALL_DISTANCE behind Mover 1, periodic over one lap.
+// Table 2 (CURVE_TABLE_ID) = the 10-point clothoid piece from BuildCurveModule, master 0..CURVE_TABLE_LENGTH from
+//                            the module start.
+// Neither table knows where the curves are. That is in aSwitch: while running, SwitchTables re-issues MC_CamIn
+// four times per lap so the NC swaps tables at 250 / 870 / 1000 / 120 mm. Change the straights = change the
+// switch positions, neither table is rebuilt.
+//
+// How to run (online view, with MAIN.eExample = TwoTableSwitching):  bStart -> watch eState -> bStop.   On Error: bReset.
+// Watch fGapActual (115 on the straights), nActiveTableID (1/2) and nSwitchCount (+4 per lap).
+PROGRAM PRG_Example4
+VAR CONSTANT
+	// --- track geometry (mm) ---
+	TRACK_LENGTH			: LREAL := 1500.0;	// = modulo factor of both mover axes
+	STRAIGHT_1_START		: LREAL := 0.0;
+	CURVE_1_START			: LREAL := 250.0;
+	STRAIGHT_2_START		: LREAL := 750.0;
+	CURVE_2_START			: LREAL := 1000.0;
+	MODULE_LENGTH			: LREAL := 500.0;	// one 180 deg curve module (AT2050)
+
+	// --- the ball clamped between the two movers (see example 2) ---
+	BALL_DISTANCE			: LREAL := 115.0;	// mm between the two jaws, measured along the ball's path
+	BALL_OFFSET				: LREAL := 103.03;	// mm the ball (and the jaws) sit outboard of the mover path
+
+	// --- the clothoid as ONE module-relative piece ---
+	CURVE_TABLE_LENGTH		: LREAL := 620.0;	// mm of master one curve piece covers, measured from the module start.
+												// Must reach past the builder's last exit knot (603): the trailing ball
+												// keeps the cam busy 103 mm after the module ends. The builder errors if not.
+	MAX_CURVE_POINTS		: UDINT := 16;
+
+	// --- demo dynamics ---
+	MASTER_VELOCITY			: LREAL := 300.0;	// mm/s, Mover 1 while running
+	POSITIONING_VELOCITY	: LREAL := 200.0;	// mm/s, Mover 2 while pre-positioning
+
+	CAM_TABLE_ID			: MC_CAM_ID := 1;	// NC > Tables > Master 1 > Slave 1: the straight table
+	CURVE_TABLE_ID			: MC_CAM_ID := 2;	// NC > Tables > Master 2 > Slave 1: the clothoid piece
+	CAM_POINTS				: UDINT := 2;		// the straight table
+	SWITCH_MISS_TOLERANCE	: LREAL := 50.0;	// mm Mover 1 may pass a queued switch position before the PLC calls it missed
+	PLC_ERROR_ID			: UDINT := 16#FFFF_FFFF;	// not an NC error: the PLC side refused (builder, layout check,
+													// missed table switch), see sTableError
+END_VAR
+VAR
+	// --- commands: set TRUE in the online view, they reset themselves ---
+	bStart				: BOOL;
+	bStop				: BOOL;
+	bReset				: BOOL;
+	eState				: E_State;
+
+	// --- table 1: the straight line, loaded into NC table CAM_TABLE_ID ---
+	aCamPoints			: ARRAY[1..CAM_POINTS] OF MC_MotionFunctionPoint;
+	stCamTable			: MC_CAM_REF;
+	bTablesOk			: BOOL;			// BuildTable succeeded (FALSE with sTableError set: the PLC side refused)
+
+	// --- table 2: the clothoid piece, loaded into NC table CURVE_TABLE_ID ---
+	fbBuilder			: FB_XtsBallCamBuilder;	// computes the clothoid points of one module
+	aCurvePoints		: ARRAY[1..MAX_CURVE_POINTS] OF MC_MotionFunctionPoint;	// 10 points, master 0..CURVE_TABLE_LENGTH from the module start
+	nCurvePoints		: UDINT;
+	stCurveTable		: MC_CAM_REF;
+	fbCurveTableSelect	: MC_CamTableSelect;	// PLC array -> NC cam table CURVE_TABLE_ID
+
+	// --- the switching ---
+	fbCamSwitch			: MC_CamIn;		// re-couples Mover 2 to the other table when Mover 1 reaches a position (online table change)
+	aSwitch				: ARRAY[1..4] OF ST_CamSwitch;	// the four switches of one lap, in track order
+	nSwitch				: UINT;			// index of the switch queued next (0 = not initialised yet)
+	fSwitchAxisPos		: LREAL;		// non-modulo Mover 1 position handed to the NC for the queued switch
+	nActiveTableID		: MC_CAM_ID;	// the table driving Mover 2 right now
+	nSwitchCount		: UDINT;		// switches done since coupling
+
+	// --- function blocks ---
+	fbPowerMover1		: MC_Power;
+	fbPowerMover2		: MC_Power;
+	fbResetMover1		: MC_Reset;
+	fbResetMover2		: MC_Reset;
+	fbCamTableSelect	: MC_CamTableSelect;			// PLC array -> NC cam table CAM_TABLE_ID
+	fbReadTable			: MC_ReadCamTableSlaveDynamics;	// "where does the table want the slave for this master position?"
+	fbMoveRelMover2		: MC_MoveRelative;
+	fbCamIn				: MC_CamIn;
+	fbMoveVeloMover1	: MC_MoveVelocity;
+	fbHaltMover1		: MC_Halt;
+	fbCamOut			: MC_CamOut;
+
+	// --- live values worth watching ---
+	fMover1Pos			: LREAL;	// modulo set position of Mover 1 (0..1500)
+	fMover2Pos			: LREAL;	// modulo set position of Mover 2 (0..1500)
+	fGapActual			: LREAL;	// how far Mover 2 is behind Mover 1 right now (along the track)
+	fGapWanted			: LREAL;	// what the straight table asked for at coupling time (= BALL_DISTANCE)
+	bError				: BOOL;
+	nErrorID			: UDINT;
+	sTableError			: STRING(255);	// why the PLC side refused: builder, layout check or missed switch (nErrorID = PLC_ERROR_ID)
+
+	// --- scratch ---
+	i					: UINT;
+	fDist				: LREAL;
+	fBest				: LREAL;
+END_VAR
+]]></Declaration>
+    <Implementation>
+      <ST><![CDATA[// update axis status every cycle
+GVL_Axes.Mover1();
+GVL_Axes.Mover2();
+
+// live gap: Mover 1 position minus Mover 2 position, wrapped to 0..1500
+fMover1Pos := GVL_Axes.Mover1.NcToPlc.ModuloSetPos;
+fMover2Pos := GVL_Axes.Mover2.NcToPlc.ModuloSetPos;
+fGapActual := fMover1Pos - fMover2Pos;
+IF fGapActual < 0.0 THEN
+	fGapActual := fGapActual + TRACK_LENGTH;
+END_IF
+
+CASE eState OF
+	E_State.Idle:
+		IF bStart THEN
+			bStart := FALSE;
+			eState := E_State.Enable;
+		END_IF
+
+	E_State.Enable:
+		fbPowerMover1.Enable := TRUE;
+		fbPowerMover1.Enable_Positive := TRUE;
+		fbPowerMover1.Enable_Negative := TRUE;
+		fbPowerMover2.Enable := TRUE;
+		fbPowerMover2.Enable_Positive := TRUE;
+		fbPowerMover2.Enable_Negative := TRUE;
+		IF fbPowerMover1.Status AND fbPowerMover2.Status THEN
+			eState := E_State.BuildTable;
+		END_IF
+
+	E_State.BuildTable:
+		// fill both point arrays once, then hand the straight table to the NC (overwrites cam table CAM_TABLE_ID)
+		IF NOT fbCamTableSelect.Execute THEN
+			BuildTable();
+		END_IF
+		IF bTablesOk THEN		// FALSE: the PLC side refused, the error check below picks up sTableError
+			fbCamTableSelect.Periodic := TRUE;		// one table = one lap, repeat forever
+			fbCamTableSelect.CamTableID := CAM_TABLE_ID;
+			fbCamTableSelect.Execute := TRUE;
+			IF fbCamTableSelect.Done THEN
+				fbCamTableSelect.Execute := FALSE;
+				eState := E_State.BuildCurveTable;
+			END_IF
+		END_IF
+
+	E_State.BuildCurveTable:
+		// the clothoid piece goes into the second NC table
+		fbCurveTableSelect.Periodic := TRUE;		// a late switch then repeats the piece instead of stopping Mover 2 at the table end
+		fbCurveTableSelect.CamTableID := CURVE_TABLE_ID;
+		fbCurveTableSelect.Execute := TRUE;
+		IF fbCurveTableSelect.Done THEN
+			fbCurveTableSelect.Execute := FALSE;
+			eState := E_State.ReadTable;
+		END_IF
+
+	E_State.ReadTable:
+		// Mover 1 stays where it is. Ask the NC what slave position the straight table wants for it.
+		// The table master runs 0..1500 = the track, so Mover 1's track position goes in as it is.
+		fbReadTable.CamTableID := CAM_TABLE_ID;
+		fbReadTable.MasterPosition := fMover1Pos;
+		fbReadTable.Execute := TRUE;
+		IF fbReadTable.Done THEN
+			fbReadTable.Execute := FALSE;
+			// table: slave = master - gap   ->   gap = master - slave
+			fGapWanted := fMover1Pos - fbReadTable.SlavePosition;
+			// Mover 1 stands still, so this relative move can never run into it:
+			// positive = Mover 2 closes up from behind, negative = Mover 2 backs off a little
+			fbMoveRelMover2.Distance := fGapActual - fGapWanted;
+			eState := E_State.Preposition;
+		END_IF
+
+	E_State.Preposition:
+		fbMoveRelMover2.Velocity := POSITIONING_VELOCITY;
+		fbMoveRelMover2.Execute := TRUE;
+		IF fbMoveRelMover2.Done THEN
+			fbMoveRelMover2.Execute := FALSE;
+			eState := E_State.CamIn;
+		END_IF
+
+	E_State.CamIn:
+		// couple to the straight table first, wherever Mover 1 stands. If that is inside a curve window the ball
+		// distance is only right from the first switch on - harmless, the movers are 115 mm apart on the track.
+		fbCamIn.CamTableID := CAM_TABLE_ID;
+		fbCamIn.StartMode := MC_STARTMODE_ABSOLUTE;		// table master axis = Mover 1 track position
+		fbCamIn.MasterOffset := 0.0;
+		fbCamIn.SlaveOffset := 0.0;
+		fbCamIn.MasterScaling := 1.0;
+		fbCamIn.SlaveScaling := 1.0;
+		// let the NC pick the slave offset so Mover 2 never jumps at coupling.
+		// After the pre-positioning above that offset is 0 (or whole laps), so the table gap applies 1:1.
+		fbCamIn.Options.SlaveScalingMode := MC_CAMSCALING_AUTOOFFSET;
+		fbCamIn.Execute := TRUE;
+		IF fbCamIn.InSync THEN
+			fbCamIn.Execute := FALSE;
+			// SwitchTables initialises itself on its first call
+			nActiveTableID := CAM_TABLE_ID;
+			nSwitch := 0;
+			nSwitchCount := 0;
+			fbCamSwitch.Execute := FALSE;
+			eState := E_State.Run;
+		END_IF
+
+	E_State.Run:
+		// only the master is commanded - the slave is driven by the cam
+		fbMoveVeloMover1.Velocity := MASTER_VELOCITY;
+		fbMoveVeloMover1.Direction := MC_Positive_Direction;
+		fbMoveVeloMover1.Execute := TRUE;
+		SwitchTables();		// keeps one table switch queued in the NC at all times
+		IF bStop THEN
+			bStop := FALSE;
+			fbMoveVeloMover1.Execute := FALSE;
+			fbCamSwitch.Execute := FALSE;
+			eState := E_State.Stopping;
+		END_IF
+
+	E_State.Stopping:
+		fbHaltMover1.Execute := TRUE;
+		IF fbHaltMover1.Done THEN
+			fbHaltMover1.Execute := FALSE;
+			eState := E_State.CamOut;
+		END_IF
+
+	E_State.CamOut:
+		fbCamOut.Execute := TRUE;
+		IF fbCamOut.Done THEN
+			fbCamOut.Execute := FALSE;
+			eState := E_State.Idle;
+		END_IF
+
+	E_State.Error:
+		fbCamTableSelect.Execute := FALSE;
+		fbCurveTableSelect.Execute := FALSE;
+		fbReadTable.Execute := FALSE;
+		fbMoveRelMover2.Execute := FALSE;
+		fbCamIn.Execute := FALSE;
+		fbCamSwitch.Execute := FALSE;
+		fbMoveVeloMover1.Execute := FALSE;
+		fbHaltMover1.Execute := FALSE;
+		fbCamOut.Execute := FALSE;
+		IF bReset THEN
+			bReset := FALSE;
+			fbResetMover1.Execute := TRUE;
+			fbResetMover2.Execute := TRUE;
+			eState := E_State.Resetting;
+		END_IF
+
+	E_State.Resetting:
+		IF (fbResetMover1.Done OR fbResetMover1.Error) AND (fbResetMover2.Done OR fbResetMover2.Error) THEN
+			fbResetMover1.Execute := FALSE;
+			fbResetMover2.Execute := FALSE;
+			bError := FALSE;
+			nErrorID := 0;
+			sTableError := '';
+			eState := E_State.Idle;
+		END_IF
+END_CASE
+
+// any error anywhere -> Error state
+IF eState <> E_State.Error AND eState <> E_State.Resetting THEN
+	IF GVL_Axes.Mover1.Status.Error THEN
+		nErrorID := GVL_Axes.Mover1.Status.ErrorID;
+	ELSIF GVL_Axes.Mover2.Status.Error THEN
+		nErrorID := GVL_Axes.Mover2.Status.ErrorID;
+	ELSIF fbPowerMover1.Error THEN
+		nErrorID := fbPowerMover1.ErrorID;
+	ELSIF fbPowerMover2.Error THEN
+		nErrorID := fbPowerMover2.ErrorID;
+	ELSIF sTableError <> '' THEN
+		nErrorID := PLC_ERROR_ID;
+	ELSIF fbCamTableSelect.Error THEN
+		nErrorID := fbCamTableSelect.ErrorID;
+	ELSIF fbCurveTableSelect.Error THEN
+		nErrorID := fbCurveTableSelect.ErrorID;
+	ELSIF fbReadTable.Error THEN
+		nErrorID := fbReadTable.ErrorID;
+	ELSIF fbMoveRelMover2.Error THEN
+		nErrorID := fbMoveRelMover2.ErrorID;
+	ELSIF fbCamIn.Error THEN
+		nErrorID := fbCamIn.ErrorID;
+	ELSIF fbCamSwitch.Error THEN
+		nErrorID := fbCamSwitch.ErrorID;
+	ELSIF fbMoveVeloMover1.Error THEN
+		nErrorID := fbMoveVeloMover1.ErrorID;
+	ELSIF fbHaltMover1.Error THEN
+		nErrorID := fbHaltMover1.ErrorID;
+	ELSIF fbCamOut.Error THEN
+		nErrorID := fbCamOut.ErrorID;
+	END_IF
+	IF nErrorID <> 0 THEN
+		bError := TRUE;
+		eState := E_State.Error;
+	END_IF
+END_IF
+
+// call every function block once per cycle
+fbPowerMover1(Axis := GVL_Axes.Mover1);
+fbPowerMover2(Axis := GVL_Axes.Mover2);
+fbResetMover1(Axis := GVL_Axes.Mover1);
+fbResetMover2(Axis := GVL_Axes.Mover2);
+fbCamTableSelect(Master := GVL_Axes.Mover1, Slave := GVL_Axes.Mover2, CamTable := stCamTable);
+fbCurveTableSelect(Master := GVL_Axes.Mover1, Slave := GVL_Axes.Mover2, CamTable := stCurveTable);
+fbReadTable();
+fbMoveRelMover2(Axis := GVL_Axes.Mover2);
+fbCamIn(Master := GVL_Axes.Mover1, Slave := GVL_Axes.Mover2);
+fbCamSwitch(Master := GVL_Axes.Mover1, Slave := GVL_Axes.Mover2);
+fbMoveVeloMover1(Axis := GVL_Axes.Mover1);
+fbHaltMover1(Axis := GVL_Axes.Mover1);
+fbCamOut(Slave := GVL_Axes.Mover2);
+]]></ST>
+    </Implementation>
+    <Action Name="BuildCurveModule" Id="{88bc508a-63f1-44f1-aaf1-426649e61bbc}">
+      <Implementation>
+        <ST><![CDATA[// ONE curve module as a module-relative cam piece: master 0..CURVE_TABLE_LENGTH measured from the module start,
+// slave measured from the same origin with the ball gap included (point 1 = (0, -BALL_DISTANCE)). The same geometry
+// as example 2, just for a single module at the origin: 8 clothoid points (ramp / plateau / ramp / line at the
+// entry, mirrored at the exit) plus one 1:1 point at each end = 10 points.
+//
+// All 10 points go into NC table CURVE_TABLE_ID. Tuning the clothoid (the knot defaults in FB_XtsBallCamBuilder)
+// happens here, once, independent of where the curves are on the track.
+fbBuilder.fMasterStart		:= 0.0;
+fbBuilder.fMasterEnd		:= CURVE_TABLE_LENGTH;
+fbBuilder.fBallDistance		:= BALL_DISTANCE;
+fbBuilder.fBallOffset		:= BALL_OFFSET;
+fbBuilder.nCurves			:= 1;
+fbBuilder.aCurveStart[1]	:= 0.0;
+fbBuilder.fModuleLength		:= MODULE_LENGTH;
+// fTransLength, aEntryKnots, aExitKnots keep the FB defaults (tuned for 115 mm / 103 mm on AT2050 modules)
+fbBuilder.pPoints			:= ADR(aCurvePoints);
+fbBuilder.nMaxPoints		:= MAX_CURVE_POINTS;
+
+IF fbBuilder.Build() THEN
+	nCurvePoints := fbBuilder.nPoints;		// 10
+ELSE
+	nCurvePoints := 0;
+	sTableError := fbBuilder.sError;
+END_IF
+]]></ST>
+      </Implementation>
+    </Action>
+    <Action Name="BuildTable" Id="{fcaef051-6938-4b18-aa72-76d8db822959}">
+      <Implementation>
+        <ST><![CDATA[// Two NC tables instead of one:
+//   table CAM_TABLE_ID   (1): a straight line, 2 points, Mover 2 BALL_DISTANCE behind Mover 1. Periodic over one lap.
+//   table CURVE_TABLE_ID (2): the clothoid piece from BuildCurveModule, master 0..CURVE_TABLE_LENGTH from the module start.
+// Neither table knows where the curves are. That is in aSwitch: while running, SwitchTables re-couples Mover 2 to
+// the other table when Mover 1 reaches these positions.
+//
+// Only the straight table is "the" table for the start-up: ReadTable, Preposition and the first CamIn use it.
+// The curve table is loaded in state BuildCurveTable.
+sTableError := '';
+bTablesOk := FALSE;
+
+// table 1: the straight line
+aCamPoints[1] := F_CamPoint(1, STRAIGHT_1_START, BALL_DISTANCE, MOTIONFUNCTYPE_POLYNOM1);	//    0: slave -115
+aCamPoints[2] := F_CamPoint(2, TRACK_LENGTH,     BALL_DISTANCE, MOTIONFUNCTYPE_POLYNOM1);	// 1500: slave 1385, lift 1500 per lap
+aCamPoints[2].RelIndexNextPoint := 0;
+stCamTable.pArray		:= ADR(aCamPoints);
+stCamTable.ArraySize	:= SIZEOF(aCamPoints);
+stCamTable.TableType	:= MC_TABLETYPE_MOTIONFUNCTION;
+stCamTable.NoOfRows		:= CAM_POINTS;
+stCamTable.NoOfColumns	:= 1;
+
+// table 2: the clothoid piece
+BuildCurveModule();		// -> aCurvePoints / nCurvePoints (sTableError set if it refused)
+IF nCurvePoints = 0 THEN RETURN; END_IF
+stCurveTable.pArray			:= ADR(aCurvePoints);
+stCurveTable.ArraySize		:= nCurvePoints * SIZEOF(MC_MotionFunctionPoint);
+stCurveTable.TableType		:= MC_TABLETYPE_MOTIONFUNCTION;
+stCurveTable.NoOfRows		:= nCurvePoints;
+stCurveTable.NoOfColumns	:= 1;
+
+// the four switches of a lap, in track order. The curve piece covers CURVE_TABLE_LENGTH from each module start, so
+// the switch back to the straight table comes 120 mm into the following straight (curve 2: after the 1500 -> 0 wrap).
+aSwitch[1].fTrackPos := CURVE_1_START;										aSwitch[1].nTableID := CURVE_TABLE_ID;	//  250
+aSwitch[2].fTrackPos := CURVE_1_START + CURVE_TABLE_LENGTH;					aSwitch[2].nTableID := CAM_TABLE_ID;	//  870
+aSwitch[3].fTrackPos := CURVE_2_START;										aSwitch[3].nTableID := CURVE_TABLE_ID;	// 1000
+aSwitch[4].fTrackPos := CURVE_2_START + CURVE_TABLE_LENGTH - TRACK_LENGTH;	aSwitch[4].nTableID := CAM_TABLE_ID;	//  120
+
+// the two curve pieces must not overlap: every straight has to be longer than the overhang (CURVE_TABLE_LENGTH - MODULE_LENGTH)
+IF CURVE_TABLE_LENGTH - MODULE_LENGTH >= MIN(CURVE_2_START - STRAIGHT_2_START, CURVE_1_START + TRACK_LENGTH - (CURVE_2_START + MODULE_LENGTH)) THEN
+	sTableError := 'curve pieces overlap - straights too short for two-table switching';
+	RETURN;
+END_IF
+
+bTablesOk := TRUE;
+]]></ST>
+      </Implementation>
+    </Action>
+    <Action Name="SwitchTables" Id="{b1268a1a-3885-4d12-9f20-82bb8ba6f9d1}">
+      <Implementation>
+        <ST><![CDATA[// Called every cycle in Run. Keeps exactly one table switch queued in the NC: MC_CamIn on an already coupled
+// slave changes the table, and with Options.ActivationMode = ATMASTERAXISPOS the NC does it when Mover 1 passes
+// Options.ActivationPosition. The PLC only has to be early, not exact. Both tables are 1:1 with gap BALL_DISTANCE
+// at every switch position, so with SlaveScalingMode = AUTOOFFSET the position of Mover 2 does not jump and its
+// velocity steps by ~1 % at most (the piece's 16 mm lead-in line has slope 1.0106, see README).
+//
+// Written against the Tc2_MC2_Camming 3.4.8 interface. Two details to confirm on the first run (see README):
+//   - ActivationPosition is given as the non-modulo axis position (NcToPlc.SetPos + distance to go).
+//   - MC_STARTMODE_RELATIVE: table master 0 = Mover 1 position at activation (= the module start for table 2).
+IF nSwitch = 0 THEN
+	// first call after coupling: start with the switch closest ahead of Mover 1
+	// (a switch to the table that is already active is harmless)
+	fBest := TRACK_LENGTH + 1.0;
+	FOR i := 1 TO 4 DO
+		fDist := aSwitch[i].fTrackPos - fMover1Pos;
+		IF fDist <= 0.0 THEN fDist := fDist + TRACK_LENGTH; END_IF
+		IF fDist < fBest THEN fBest := fDist; nSwitch := i; END_IF
+	END_FOR
+END_IF
+
+IF NOT fbCamSwitch.Execute THEN
+	// queue the next switch
+	fDist := aSwitch[nSwitch].fTrackPos - fMover1Pos;
+	IF fDist <= 0.0 THEN fDist := fDist + TRACK_LENGTH; END_IF
+	fSwitchAxisPos := GVL_Axes.Mover1.NcToPlc.SetPos + fDist;
+	fbCamSwitch.CamTableID := aSwitch[nSwitch].nTableID;
+	fbCamSwitch.StartMode := MC_STARTMODE_RELATIVE;
+	fbCamSwitch.MasterOffset := 0.0;
+	fbCamSwitch.SlaveOffset := 0.0;
+	fbCamSwitch.MasterScaling := 1.0;
+	fbCamSwitch.SlaveScaling := 1.0;
+	fbCamSwitch.Options.SlaveScalingMode := MC_CAMSCALING_AUTOOFFSET;
+	fbCamSwitch.Options.ActivationMode := MC_CAMACTIVATION_ATMASTERAXISPOS;
+	fbCamSwitch.Options.ActivationPosition := fSwitchAxisPos;
+	fbCamSwitch.Execute := TRUE;
+ELSIF fbCamSwitch.InSync THEN
+	// the NC has switched
+	fbCamSwitch.Execute := FALSE;
+	nActiveTableID := aSwitch[nSwitch].nTableID;
+	nSwitchCount := nSwitchCount + 1;
+	nSwitch := nSwitch MOD 4 + 1;
+ELSIF GVL_Axes.Mover1.NcToPlc.SetPos > fSwitchAxisPos + SWITCH_MISS_TOLERANCE THEN
+	// Mover 1 is well past the position and the NC did not switch - stop rather than run the wrong table
+	sTableError := 'cam table switch missed';		// -> PLC_ERROR_ID
+END_IF
+]]></ST>
+      </Implementation>
+    </Action>
+  </POU>
+</TcPlcObject>

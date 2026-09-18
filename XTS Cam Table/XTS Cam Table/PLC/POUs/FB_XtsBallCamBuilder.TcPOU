@@ -3,7 +3,8 @@
   <POU Name="FB_XtsBallCamBuilder" Id="{a03eda8c-4ede-42f2-a813-b4f495638e46}" SpecialFunc="None">
     <Declaration><![CDATA[FUNCTION_BLOCK FB_XtsBallCamBuilder
 (* Builds a TwinCAT motion-function cam table (MC_MotionFunctionPoint array) for two XTS movers that
-   must keep a constant distance measured along the path of a ball mounted outward of the mover path.
+   pinch one ball between them like tongs: each mover carries a jaw outward of the mover path, and the two
+   jaws must keep a constant distance measured along the path of the ball so it stays clamped in the curves.
    Track: straights and 180 deg modules (Beckhoff AT2050 geometry: quintic curvature ramp + circular arc).
    Layout per module: entry ramp up (POLYNOM3) - plateau (POLYNOM1) - ramp down (POLYNOM3) - line (POLYNOM1)
                       exit  ramp down (POLYNOM3) - plateau (POLYNOM1) - ramp up (POLYNOM3) - line (POLYNOM1)
@@ -13,14 +14,14 @@ VAR_INPUT
 	// ---- cam table range ----
 	fMasterStart		: LREAL := 180.0;		// [mm] master position of the first point
 	fMasterEnd			: LREAL := 1680.0;		// [mm] master position of the last point
-	fBallDistance		: LREAL := 115.0;		// [mm] distance master ball -> slave ball along the ball path (slave trails the master)
+	fBallDistance		: LREAL := 115.0;		// [mm] distance master jaw -> slave jaw along the ball path (slave trails the master)
 
 	// ---- track layout in master coordinates ----
 	nCurves				: UINT  := 2;			// number of 180 deg modules inside the table range
 	aCurveStart			: ARRAY[1..4] OF LREAL := [250.0, 1000.0, 0.0, 0.0];	// [mm] start of each module
 	fModuleLength		: LREAL := 500.0;		// [mm] module length along the mover path (AT2050: 500)
 	fTransLength		: LREAL := 84.0;		// [mm] curvature transition length at each module end (quintic ramp)
-	fBallOffset			: LREAL := 103.03;		// [mm] lateral offset of the ball, outward of the mover path (r_ball - r_xts)
+	fBallOffset			: LREAL := 103.03;		// [mm] lateral offset of the ball centre (and the jaws), outward of the mover path (r_ball - r_xts)
 
 	// ---- knot layout, offsets relative to the module start [mm] (optimised for D = 115 mm, offset 103 mm) ----
 	aEntryKnots			: ARRAY[1..4] OF LREAL := [16.0, 67.5, 90.5, 134.7];	// ramp start, plateau start, plateau end, ramp end

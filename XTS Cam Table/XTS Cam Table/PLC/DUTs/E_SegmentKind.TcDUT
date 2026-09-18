@@ -1,0 +1,13 @@
+<?xml version="1.0" encoding="utf-8"?>
+<TcPlcObject Version="1.1.0.1">
+  <DUT Name="E_SegmentKind" Id="{7563ea44-c0ea-45b3-8b83-c76f4d6f6166}">
+    <Declaration><![CDATA[// One piece of track as FB_XtsCamStitcher sees it (StitchedSegments example)
+TYPE E_SegmentKind :
+(
+	Straight,	// mover path and ball path have the same length: the cam runs 1:1, no table points needed
+	Curve		// one 180 deg module: the stitcher pastes the module-relative clothoid points (PRG_Example3.aCurvePoints)
+);
+END_TYPE
+]]></Declaration>
+  </DUT>
+</TcPlcObject>

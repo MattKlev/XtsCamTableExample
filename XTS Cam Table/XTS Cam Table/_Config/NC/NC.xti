@@ -18,6 +18,8 @@
 		</SvbTask>
 		<Axis File="Mover Axis 1.xti" Id="1"/>
 		<Axis File="Mover Axis 2.xti" Id="2"/>
+		<Axis File="VirtualMaster.xti" Id="3"/>
 		<Table File="Master 1.xti"/>
+		<Table File="Master 2.xti"/>
 	</NC>
 </TcSmItem>

@@ -21,12 +21,16 @@
 	<Mappings>
 		<OwnerA>
 			<OwnerB Name="TINC^NC-Task 1^Axes^Mover Axis 1">
-				<Link VarA="PlcTask Inputs^MAIN.Mover1.NcToPlc" VarB="Outputs^ToPlc"/>
-				<Link VarA="PlcTask Outputs^MAIN.Mover1.PlcToNc" VarB="Inputs^FromPlc"/>
+				<Link VarA="PlcTask Inputs^GVL_Axes.Mover1.NcToPlc" VarB="Outputs^ToPlc"/>
+				<Link VarA="PlcTask Outputs^GVL_Axes.Mover1.PlcToNc" VarB="Inputs^FromPlc"/>
 			</OwnerB>
 			<OwnerB Name="TINC^NC-Task 1^Axes^Mover Axis 2">
-				<Link VarA="PlcTask Inputs^MAIN.Mover2.NcToPlc" VarB="Outputs^ToPlc"/>
-				<Link VarA="PlcTask Outputs^MAIN.Mover2.PlcToNc" VarB="Inputs^FromPlc"/>
+				<Link VarA="PlcTask Inputs^GVL_Axes.Mover2.NcToPlc" VarB="Outputs^ToPlc"/>
+				<Link VarA="PlcTask Outputs^GVL_Axes.Mover2.PlcToNc" VarB="Inputs^FromPlc"/>
+			</OwnerB>
+			<OwnerB Name="TINC^NC-Task 1^Axes^VirtualMaster">
+				<Link VarA="PlcTask Inputs^GVL_Axes.VirtualMaster.NcToPlc" VarB="Outputs^ToPlc"/>
+				<Link VarA="PlcTask Outputs^GVL_Axes.VirtualMaster.PlcToNc" VarB="Inputs^FromPlc"/>
 			</OwnerB>
 		</OwnerA>
 	</Mappings>

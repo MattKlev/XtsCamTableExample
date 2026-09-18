@@ -23,7 +23,7 @@ END_VAR
       <ST><![CDATA[F_CamPoint.PointIndex		:= nIndex;
 F_CamPoint.FunctionType		:= eFuncToNext;
 F_CamPoint.PointType		:= MOTIONPOINTTYPE_VELOCITY;	// velocity is given, acceleration is 0
-F_CamPoint.RelIndexNextPoint	:= 1;		// next point is index+1 (MAIN sets 0 on the last point)
+F_CamPoint.RelIndexNextPoint	:= 1;		// next point is index+1 (the caller sets 0 on the last point)
 F_CamPoint.MasterPos		:= fMasterPos;
 F_CamPoint.SlavePos			:= fMasterPos - fGap;
 F_CamPoint.SlaveVelo		:= 1.0;		// dSlave/dMaster = 1 -> both movers travel at the same speed here

@@ -1,0 +1,13 @@
+<?xml version="1.0" encoding="utf-8"?>
+<TcPlcObject Version="1.1.0.1">
+  <DUT Name="ST_CamSwitch" Id="{39323163-3e50-48a2-8d69-1da1fbe5875c}">
+    <Declaration><![CDATA[// One cam table switch of the TwoTableSwitching example: when Mover 1 passes fTrackPos, table nTableID takes over
+TYPE ST_CamSwitch :
+STRUCT
+	fTrackPos	: LREAL;		// [mm] track position of Mover 1 (0..TRACK_LENGTH) where the NC switches
+	nTableID	: MC_CAM_ID;	// cam table that becomes active there
+END_STRUCT
+END_TYPE
+]]></Declaration>
+  </DUT>
+</TcPlcObject>
