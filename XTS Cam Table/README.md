@@ -1,6 +1,7 @@
 # XTS Cam Table - minimal examples
 
-Mover 1 is the master. Mover 2 follows it through a cam table. The track is 1500 mm long
+Mover 1 is the master. Mover 2 follows it through a cam table. (Example 5 is the exception: there a
+virtual axis is the master and both movers follow it.) The track is 1500 mm long
 (modulo 1500): two 250 mm straights and two 500 mm 180 degree curve modules (AT2050):
 straight 0..250, curve 250..750, straight 750..1000, curve 1000..1500.
 
@@ -14,6 +15,7 @@ two movers. Pick the example in `MAIN`, then open that program in the online vie
 | 2 `ClothoidBallGap`     | `PRG_Example2` | 1         | 18     | a ball clamped between the two movers through the AT2050 clothoid transitions |
 | 3 `StitchedSegments`    | `PRG_Example3` | 1         | 18     | the same table, assembled from a track layout and ONE reusable clothoid piece |
 | 4 `TwoTableSwitching`   | `PRG_Example4` | 2         | 2 + 10 | a straight table and a clothoid table, the NC swaps them while running   |
+| 5 `VirtualMasterSplit`  | `PRG_Example5` | 2         | 10 + 10 | the ball is the master: a virtual axis runs its path, both movers are slaves and share the curve work |
 
 ## Example 1: `ConstantGap` (9 points)
 
@@ -79,8 +81,8 @@ Two NC tables, and the NC swaps them while the movers run:
 
 | Table                          | NC                          | Content                                                      |
 |--------------------------------|-----------------------------|--------------------------------------------------------------|
-| straight, `CAM_TABLE_ID` = 1   | Tables > Master 1 > Slave 1 | 2 points, slave = master - 115, periodic over 1500           |
-| curve, `CURVE_TABLE_ID` = 2    | Tables > Master 2 > Slave 1 | the 10-point clothoid piece from `PRG_Example4.BuildCurveModule`, periodic over 620 |
+| straight, `CAM_TABLE_ID` = 1   | Tables > `Table 1 (Ex 1-4)` > `Mover 2`     | 2 points, slave = master - 115, periodic over 1500           |
+| curve, `CURVE_TABLE_ID` = 2    | Tables > `Table 2 (Ex 4 curve)` > `Mover 2` | the 10-point clothoid piece from `PRG_Example4.BuildCurveModule`, periodic over 620 |
 
 Neither table knows where the curves are. That is in `aSwitch`:
 
@@ -120,6 +122,75 @@ If the first run misbehaves, check these first:
 - `MC_STARTMODE_RELATIVE` is assumed to take the master position at activation, not at the
   command. If the curve table is visibly shifted (a speed step at 250), use
   `MC_STARTMODE_ABSOLUTE` with `MasterOffset` set to the curve start (sign to be tried).
+
+## Example 5: `VirtualMasterSplit` (10 + 10 points, two tables, one virtual master)
+
+Examples 2 to 4 all have Mover 1 running at constant speed and Mover 2 doing all the work: to
+keep the ball clamped, Mover 2 runs at 178 % of Mover 1's speed going into a curve and 56 %
+coming out. Example 5 splits that work between the two movers by making the **ball** the master.
+
+- NC axis `VirtualMaster` (axis 3, a simulation axis without modulo) is the ball. Its position is the
+  distance the ball has travelled along its own path. That path lies 103 mm outboard of the track,
+  so one lap of the ball is longer than one lap of the track:
+  `fBallLap` = 1500 + 2 pi x 103.03 = 2147.36 mm.
+- Both movers are slaves of the virtual master, each through its own table:
+
+| Table                          | NC                          | Slave   | Content                                                     |
+|--------------------------------|-----------------------------|---------|-------------------------------------------------------------|
+| `MOVER1_TABLE_ID` = 3          | Tables > `Table 3 (Ex 5 Mover 1)` > `Mover 1` | Mover 1 | where Mover 1 is when its jaw is 57.5 mm **ahead** of the ball on the ball's path |
+| `MOVER2_TABLE_ID` = 4          | Tables > `Table 4 (Ex 5 Mover 2)` > `Mover 2` | Mover 2 | where Mover 2 is when its jaw is 57.5 mm **behind** the ball on the ball's path |
+
+The jaws are then 115 mm apart along the ball's path, exactly as in example 2. What changed is
+who runs at constant speed. On a straight the ball's path and the track are parallel, so both
+movers run at the ball's speed (ratio 1). While a mover's jaw is in a curve the ball travels
+further than the mover, so that mover runs at 1 / 1.78 = 56 % of the ball's speed. Each mover
+slows down exactly while *its own* jaw is in the module's curvature ramp, Mover 1 first, Mover 2
+one ball distance later. The two tables are therefore the same curve, shifted by 115 mm along
+the master, and no mover ever runs faster than the ball:
+
+| Master                  | Mover 1 speed / master speed | Mover 2 speed / master speed |
+|-------------------------|------------------------------|------------------------------|
+| Example 2 (Mover 1)     | 1.00 everywhere              | 0.56 .. 1.78                 |
+| Example 5 (the ball)    | 0.56 .. 1.00                 | 0.56 .. 1.00                 |
+
+`FB_XtsBallCamBuilder.BuildBallMaster(fJawLead)` writes one such table: for a ball position it
+returns the mover position whose jaw is `fJawLead` further along the ball's path (+57.5 for Mover 1,
+-57.5 for Mover 2). The knots need no tuning because the events are known exactly: the ramp runs
+while the jaw is in the module's 84 mm curvature transition. Per curve that is 4 points (POLYNOM5
+ramp down, line on the arc, POLYNOM5 ramp up, line on the straight), plus one point at each end
+= 10 points. With 5th-order ramps between exact knots the jaw distance stays within 0.5 mm of
+115 (the tuned 18-point table of example 2: 0.2 mm; 3rd-order ramps here would give 2.2 mm).
+
+Both tables cover one lap of the track, from ball position `TABLE_START` (125, still on straight 1,
+where the ball's path position equals the track position) to `TABLE_START` + 2147.36. Slave lift
+per lap: 1500. `TABLE_START` has to be between 57.5 and 192.5: Mover 1's jaw must still be before
+curve 1 at the first point, and Mover 2's last exit ramp must end before the table does.
+
+The start-up differs from example 2 in one step. After both tables are loaded (`BuildTable`,
+`LoadMover2Table`), the state `AlignMaster` tells the virtual master where the ball is:
+Mover 1 stands at track position `fMover1Pos`, its jaw is `BallArc(fMover1Pos)` along the ball's
+path, and the ball is half a ball distance behind that. `MC_SetPosition` puts the virtual master
+there (`fMasterInTable`, mapped into the table's master range). `ReadTable` then asks both tables
+where they want their mover for that ball position: table 3 should answer "where Mover 1 already
+is" (`fAlignError`, expect 0), and table 4 says where Mover 2 has to go. Mover 2 is pre-positioned
+by the difference, both movers are coupled with `MC_CamIn` (absolute start mode, auto offset),
+and `MC_MoveVelocity` runs the virtual master at `MASTER_VELOCITY`. Stop halts the virtual master
+and decouples both movers.
+
+Watch `fRatioMover1` / `fRatioMover2` (set velocity of the mover divided by that of the virtual
+master): 1.0 on the straights, 0.56 while that mover's jaw is in a curve, Mover 1 dipping first.
+`fBallPos` is the ball's position in its lap (0 = above track position 0, wraps at 2147.36).
+
+Like example 4, two details were taken from the Tc2_MC2_Camming interface and not from a
+running system:
+
+- The interior points are `MOTIONPOINTTYPE_ACTIVATION` with zero dynamics, as in the example 2
+  table, so the NC takes the ramp end velocities from the adjacent lines. For a POLYNOM5 ramp it
+  also needs the end accelerations, which the adjacent lines give as 0. If the first run shows a
+  rough transition at the ramp ends, change the two `MOTIONFUNCTYPE_POLYNOM5` in `BuildBallMaster`
+  to `MOTIONFUNCTYPE_POLYNOM3` (2.2 mm jaw distance error instead of 0.5, but only velocities needed).
+- `MC_SetPosition` on the enabled virtual master before coupling. If the NC rejects it, `bReset`
+  and try again with the virtual master disabled (move the `AlignMaster` state before `Enable`).
 
 ## One table or two? Pros and cons
 
@@ -171,23 +242,33 @@ runtime. Example 4 is here to show how the switching works and what it costs.
 - `PLC/POUs/PRG_Example4.TcPOU` - example 4. `BuildCurveModule` as in example 3, `BuildTable`
   fills the straight table, describes both tables and the switch positions, `SwitchTables` queues
   the table switches while running. Its state machine has the extra step `BuildCurveTable`.
-- `PLC/GVLs/GVL_Axes.TcGVL` - `Mover1` / `Mover2`, the two `AXIS_REF`s shared by all examples.
+- `PLC/POUs/PRG_Example5.TcPOU` - example 5. `BuildTable` runs `FB_XtsBallCamBuilder.BuildBallMaster`
+  twice (once per mover, ball as master) and describes both tables. Its state machine has the extra
+  steps `LoadMover2Table` and `AlignMaster`, and it powers, runs, halts and resets the virtual master.
+- `PLC/GVLs/GVL_Axes.TcGVL` - `Mover1` / `Mover2` / `VirtualMaster`, the `AXIS_REF`s shared by all
+  examples (`VirtualMaster` is used by example 5 only).
 - `PLC/POUs/F_CamPoint.TcPOU` - builds one `MC_MotionFunctionPoint` from
   (index, master position, gap, curve type). Slave position = master - gap.
 - `PLC/POUs/FB_XtsBallCamBuilder.TcPOU` - the ClothoidBallGap geometry and point writer.
-  Call `Build()` once with a pointer to the point array. `SlavePos(master)` and
-  `SpeedRatio(master)` are public if you want to check the table by hand.
+  Call `Build()` once with a pointer to the point array (master = Mover 1, examples 2 to 4) or
+  `BuildBallMaster(fJawLead)` (master = the ball, example 5). `SlavePos(master)`,
+  `SpeedRatio(master)`, `BallArc(mover)` and `InvBallArc(ball)` are public if you want to check a
+  table by hand.
 - `PLC/POUs/FB_XtsCamStitcher.TcPOU` - lays straight and curve segments end to end into one
   lap table (example 3).
-- `PLC/DUTs/E_Example.TcDUT` - the four examples (what `MAIN.eExample` selects).
-- `PLC/DUTs/E_State.TcDUT` - the steps of the sequence, shared by the four programs.
+- `PLC/DUTs/E_Example.TcDUT` - the five examples (what `MAIN.eExample` selects).
+- `PLC/DUTs/E_State.TcDUT` - the steps of the sequence, shared by the five programs.
 - `PLC/DUTs/E_SegmentKind.TcDUT`, `ST_CamSegment.TcDUT` - the layout entries for the stitcher.
 - `PLC/DUTs/ST_CamSwitch.TcDUT` - one table switch (track position, table ID) for example 4.
-- NC > Tables > `Master 1` > `Slave 1` - cam table ID 1. NC > Tables > `Master 2` > `Slave 1` -
-  cam table ID 2 (example 4 only). Both are empty in the project; the PLC fills them at runtime
-  with `MC_CamTableSelect`.
-- `_Config/PLC/PLC Instance.xti` - links `GVL_Axes.Mover1` / `GVL_Axes.Mover2` to `Mover Axis 1` /
-  `Mover Axis 2`.
+- NC > Tables: the node names carry the table ID, the examples that use it and the slave.
+  `Table 1 (Ex 1-4)` > `Mover 2` is cam table ID 1 (Mover 1 to Mover 2). `Table 2 (Ex 4 curve)` >
+  `Mover 2` is ID 2 (example 4 only). `Table 3 (Ex 5 Mover 1)` > `Mover 1` and
+  `Table 4 (Ex 5 Mover 2)` > `Mover 2` are IDs 3 and 4 (example 5 only, virtual master to each
+  mover). All of them only hold a placeholder in the project; the PLC fills them at runtime with
+  `MC_CamTableSelect`. The ID is the `Id` attribute in the table's `.xti`, not the name.
+- NC > Axes > `VirtualMaster` - axis 3, a simulation axis without modulo (example 5 only).
+- `_Config/PLC/PLC Instance.xti` - links `GVL_Axes.Mover1` / `GVL_Axes.Mover2` /
+  `GVL_Axes.VirtualMaster` to `Mover Axis 1` / `Mover Axis 2` / `VirtualMaster`.
 
 Only Beckhoff standard libraries are used (Tc2_MC2, Tc2_MC2_Camming, Tc2_Standard, Tc2_System).
 
@@ -195,32 +276,45 @@ Only Beckhoff standard libraries are used (Tc2_MC2, Tc2_MC2_Camming, Tc2_Standar
 
 0. `MAIN.eExample`: pick the example. `MAIN` switches to that program as soon as the current one
    is in `Idle`. Everything below happens in the selected `PRG_ExampleN`.
-1. `bStart`: power on both movers, build the table and load it into the NC (example 4: both
+1. `bStart`: power on both movers, decouple a slave that is still coupled from an earlier run
+   (`Decouple`, see the notes), build the table and load it into the NC (examples 4 and 5: both
    tables), ask the NC where the table wants Mover 2 for Mover 1's current position
    (`MC_ReadCamTableSlaveDynamics`), move Mover 2 there with a relative move (Mover 1 does not
    move, so they cannot collide), couple with `MC_CamIn`, then run Mover 1 at `MASTER_VELOCITY`.
-2. `bStop`: halt Mover 1 (Mover 2 stops with it through the cam), then `MC_CamOut`.
-3. `bReset`: from `Error`, resets both axes and goes back to `Idle`.
+   Example 5: the virtual master is powered too, set to the ball position that matches Mover 1
+   before the tables are read, both movers are coupled to it, and it is the virtual master that runs.
+2. `bStop`: halt Mover 1 (Mover 2 stops with it through the cam), then `MC_CamOut`. Example 5:
+   halt the virtual master, both movers stop with it, then `MC_CamOut` on both.
+3. `bReset`: from `Error`, resets both axes (example 5: all three) and goes back to `Idle`.
+   In `Error` the master is halted if it is still running: an error on the slave does not stop
+   the master by itself, and on a closed track the master would otherwise run into the stopped slave.
 
 Watch `fGapActual` while it runs. ConstantGap: 100 on the straights, 60 in the curves, with a
-smooth blend at the start of each section. ClothoidBallGap, StitchedSegments and
-TwoTableSwitching: 115 on the straights, dipping and rising through the curve transitions.
+smooth blend at the start of each section. ClothoidBallGap, StitchedSegments, TwoTableSwitching
+and VirtualMasterSplit: 115 on the straights, dipping and rising through the curve transitions.
 
 If the PLC side refuses (clothoid builder, stitcher, or a missed table switch), `nErrorID` is
 `16#FFFFFFFF` (`PLC_ERROR_ID`) and `sTableError` says why.
 
 ## Notes
 
+- After an axis error the NC keeps the cam coupling, and `MC_Reset` does not clear it. The next
+  `MC_CamTableSelect` on that table then fails with NC error 0x4A26 ("not possible to remove the
+  table ... because 1 drive(s) operate currently with this table"). That is why every program has
+  the `Decouple` step right after `Enable`: `MC_CamOut` on every slave whose `Status.Coupled` is
+  still set, before any table is loaded. It also covers a coupling left over from a PLC download.
 - All single-lap tables have a "lift" of 1500 per lap (ConstantGap: slave -60 -> 1440,
   ClothoidBallGap / StitchedSegments: slave 65 -> 1565, the straight table of example 4:
   -115 -> 1385). The NC adds 1500 per lap automatically (cyclic cam with lift, see the TF5050
-  docs). The curve table of example 4 has a lift of 620 over its 620 mm master range.
+  docs). The curve table of example 4 has a lift of 620 over its 620 mm master range. The two
+  tables of example 5 have a lift of 1500 over a 2147.36 mm master range (one lap of the ball).
 - `MC_CamIn` uses `MC_STARTMODE_ABSOLUTE` with `SlaveScalingMode = MC_CAMSCALING_AUTOOFFSET`,
   so Mover 2 never jumps at coupling. If the pre-positioning was exact, the offset is a
   whole number of laps and the table gaps apply as written.
 - Before pre-positioning, examples 2 and 3 map Mover 1's track position into the table's master
   range (`fMasterInTable`): a position below the table start (180) is one lap further on in the
   table. The tables of examples 1 and 4 start at 0, so those programs pass the track position as it is.
+  Example 5 does the same with the ball position it computes for Mover 1 (table start 125, lap 2147.36).
 - Example 4: if Mover 1 stands inside a curve window at `bStart`, the movers are coupled 115 mm
   apart on the track (straight table) and the ball distance is only correct from the first
   switch on. Harmless, nothing collides.
@@ -228,6 +322,6 @@ If the PLC side refuses (clothoid builder, stitcher, or a missed table switch), 
   run ahead instead, change the sign in `F_CamPoint` (slave = master + gap) or set a negative
   `BALL_DISTANCE`.
 - To add another example: copy the program closest to it (`PRG_Example1` for a hand-written
-  table, `PRG_Example3` if you want the clothoid piece), change its `BuildTable`, add a value to
-  `E_Example` and a line to the `CASE` in `MAIN`. Each program owns its constants, so nothing
-  else has to change.
+  table, `PRG_Example3` if you want the clothoid piece, `PRG_Example5` for a virtual master with
+  several slaves), change its `BuildTable`, add a value to `E_Example` and a line to the `CASE`
+  in `MAIN`. Each program owns its constants, so nothing else has to change.

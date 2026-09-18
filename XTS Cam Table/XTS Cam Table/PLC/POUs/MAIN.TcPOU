@@ -6,7 +6,7 @@
 //   Mover 1 = master, runs at constant velocity around the track.
 //   Mover 2 = slave, follows Mover 1 through a cam table.
 //
-// Four examples, each a self-contained program with its own constants, table builder and sequence:
+// Five examples, each a self-contained program with its own constants, table builder and sequence:
 //
 //   PRG_Example1  ConstantGap        9 points. Mover 2 is 100 mm behind Mover 1 on the straights and 60 mm in the
 //                                    curves, blended at the start of every section. Written by hand with F_CamPoint.
@@ -18,6 +18,9 @@
 //                                    that FB_XtsCamStitcher pastes wherever the track layout says "Curve".
 //   PRG_Example4  TwoTableSwitching  Two NC tables, a straight line and the clothoid piece. While running, the NC
 //                                    swaps them at the curve boundaries (MC_CamIn on the coupled slave).
+//   PRG_Example5  VirtualMasterSplit The BALL is the master: a virtual axis runs along the ball's path at constant
+//                                    speed and BOTH movers are slaves with their own 10-point table. The curve work
+//                                    that Mover 2 did alone in example 2 is split between the two movers.
 //
 // How to run (online view):  pick eExample here, then open that program: bStart -> watch eState -> bStop.
 // On Error: bReset.   The examples share the two movers (GVL_Axes), so only the selected program is called.
@@ -35,6 +38,7 @@ END_VAR
 	E_Example.ClothoidBallGap:		PRG_Example2();		bIdle := PRG_Example2.eState = E_State.Idle;
 	E_Example.StitchedSegments:		PRG_Example3();		bIdle := PRG_Example3.eState = E_State.Idle;
 	E_Example.TwoTableSwitching:	PRG_Example4();		bIdle := PRG_Example4.eState = E_State.Idle;
+	E_Example.VirtualMasterSplit:	PRG_Example5();		bIdle := PRG_Example5.eState = E_State.Idle;
 END_CASE
 
 IF bIdle THEN

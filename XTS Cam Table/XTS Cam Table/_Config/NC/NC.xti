@@ -19,7 +19,9 @@
 		<Axis File="Mover Axis 1.xti" Id="1"/>
 		<Axis File="Mover Axis 2.xti" Id="2"/>
 		<Axis File="VirtualMaster.xti" Id="3"/>
-		<Table File="Master 1.xti"/>
-		<Table File="Master 2.xti"/>
+		<Table File="Table 1 (Ex 1-4).xti"/>
+		<Table File="Table 2 (Ex 4 curve).xti"/>
+		<Table File="Table 3 (Ex 5 Mover 1).xti"/>
+		<Table File="Table 4 (Ex 5 Mover 2).xti"/>
 	</NC>
 </TcSmItem>

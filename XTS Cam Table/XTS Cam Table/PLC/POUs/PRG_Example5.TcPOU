@@ -1,0 +1,476 @@
+﻿<?xml version="1.0" encoding="utf-8"?>
+<TcPlcObject Version="1.1.0.1">
+  <POU Name="PRG_Example5" Id="{ed86bf60-3eee-46d4-8564-e1548ba719b0}" SpecialFunc="None">
+    <Declaration><![CDATA[// Example 5 - VirtualMasterSplit: the BALL is the master. A virtual axis runs along the ball's path at constant
+// velocity and BOTH movers follow it, each through its own cam table (10 points each from FB_XtsBallCamBuilder).
+//
+//   VirtualMaster = the ball. Its position is the distance the ball has travelled along its own path. That path
+//                   lies BALL_OFFSET outboard of the track, so one lap of the ball is TRACK_LENGTH + 2*pi*BALL_OFFSET
+//                   = 2147.36 mm (fBallLap), not 1500.
+//   Mover 1       = slave of the virtual master. Its jaw sits BALL_DISTANCE/2 ahead of the ball along that path.
+//   Mover 2       = slave of the virtual master. Its jaw sits BALL_DISTANCE/2 behind the ball.
+//
+// In example 2 Mover 1 ran at constant speed and Mover 2 did all the work: 178 % of Mover 1's speed going into a
+// curve, 56 % coming out. Here the ball runs at constant speed instead. On the straights both movers run at the
+// ball's speed. While a mover's jaw is in a curve the ball travels further than the mover (its path is longer), so
+// that mover runs at 56 % of the ball's speed. Each mover slows down exactly while ITS jaw is in the curvature ramp
+// of the module, so the two tables are the same curve shifted by BALL_DISTANCE along the master, and neither mover
+// ever has to run faster than the ball.
+//
+// How to run (online view, with MAIN.eExample = VirtualMasterSplit):  bStart -> watch eState -> bStop.   On Error: bReset.
+// Watch fGapActual (115 on the straights, dipping through the curves as in example 2) and fRatioMover1 / fRatioMover2
+// (1.0 on the straights, 0.56 while that mover's jaw is in a curve, Mover 1 first, Mover 2 a moment later).
+PROGRAM PRG_Example5
+VAR CONSTANT
+	// --- track geometry (mm) ---
+	TRACK_LENGTH			: LREAL := 1500.0;	// = modulo factor of both mover axes
+	CURVE_1_START			: LREAL := 250.0;
+	CURVE_2_START			: LREAL := 1000.0;
+	MODULE_LENGTH			: LREAL := 500.0;	// one 180 deg curve module (AT2050)
+
+	// --- the ball clamped between the two movers (see example 2) ---
+	BALL_DISTANCE			: LREAL := 115.0;	// mm between the two jaws, measured along the ball's path
+	BALL_OFFSET				: LREAL := 103.03;	// mm the ball (and the jaws) sit outboard of the mover path
+	TABLE_START				: LREAL := 125.0;	// track position of the ball at the first table point. Any point on
+												// straight 1 that keeps both tables clear of the 1500 -> 0 wrap works
+												// (57.5 < x < 192.5: Mover 1's jaw must still be before curve 1, Mover 2's
+												// last exit ramp must end before the table does).
+
+	// --- demo dynamics ---
+	MASTER_VELOCITY			: LREAL := 300.0;	// mm/s, the ball while running (= the movers' speed on the straights)
+	POSITIONING_VELOCITY	: LREAL := 200.0;	// mm/s, Mover 2 while pre-positioning
+
+	MOVER1_TABLE_ID			: MC_CAM_ID := 3;	// NC > Tables > Table 3 (Ex 5 Mover 1) > Mover 1  (VirtualMaster -> Mover 1)
+	MOVER2_TABLE_ID			: MC_CAM_ID := 4;	// NC > Tables > Table 4 (Ex 5 Mover 2) > Mover 2  (VirtualMaster -> Mover 2)
+	MAX_CAM_POINTS			: UDINT := 16;		// the builder writes 4 per curve + 2 = 10 per table
+	PLC_ERROR_ID			: UDINT := 16#FFFF_FFFF;	// not an NC error: the builder refused, see sTableError
+END_VAR
+VAR
+	// --- commands: set TRUE in the online view, they reset themselves ---
+	bStart				: BOOL;
+	bStop				: BOOL;
+	bReset				: BOOL;
+	eState				: E_State;
+
+	// --- cam table data: one table per mover, both with the ball as master ---
+	aMover1Points		: ARRAY[1..MAX_CAM_POINTS] OF MC_MotionFunctionPoint;	// -> NC table MOVER1_TABLE_ID
+	aMover2Points		: ARRAY[1..MAX_CAM_POINTS] OF MC_MotionFunctionPoint;	// -> NC table MOVER2_TABLE_ID
+	nMover1Points		: UDINT;		// points actually used (10)
+	nMover2Points		: UDINT;		// points actually used (10)
+	stMover1Table		: MC_CAM_REF;
+	stMover2Table		: MC_CAM_REF;
+	bTablesOk			: BOOL;			// BuildTable succeeded (FALSE with sTableError set: the builder refused)
+	fbBuilder			: FB_XtsBallCamBuilder;	// computes the points; also used to convert Mover 1's position into a ball position
+	fBallLap			: LREAL;		// mm the ball travels per lap of the track = master period of both tables (2147.36)
+	fTableMasterStart	: LREAL;		// ball position of the first table point (= TABLE_START, the ball is still on the straight)
+
+	// --- function blocks ---
+	fbPowerMover1		: MC_Power;
+	fbPowerMover2		: MC_Power;
+	fbPowerMaster		: MC_Power;
+	fbResetMover1		: MC_Reset;
+	fbResetMover2		: MC_Reset;
+	fbResetMaster		: MC_Reset;
+	fbTableSelectMover1	: MC_CamTableSelect;			// PLC array -> NC cam table MOVER1_TABLE_ID
+	fbTableSelectMover2	: MC_CamTableSelect;			// PLC array -> NC cam table MOVER2_TABLE_ID
+	fbSetMasterPos		: MC_SetPosition;				// puts the virtual master where the ball is for Mover 1's position
+	fbReadTableMover1	: MC_ReadCamTableSlaveDynamics;	// "where does table 3 want Mover 1 for this ball position?"
+	fbReadTableMover2	: MC_ReadCamTableSlaveDynamics;	// "where does table 4 want Mover 2 for this ball position?"
+	fbMoveRelMover2		: MC_MoveRelative;
+	fbCamInMover1		: MC_CamIn;
+	fbCamInMover2		: MC_CamIn;
+	fbMoveVeloMaster	: MC_MoveVelocity;
+	fbHaltMaster		: MC_Halt;
+	fbCamOutMover1		: MC_CamOut;
+	fbCamOutMover2		: MC_CamOut;
+
+	// --- live values worth watching ---
+	fMover1Pos			: LREAL;	// modulo set position of Mover 1 (0..1500)
+	fMover2Pos			: LREAL;	// modulo set position of Mover 2 (0..1500)
+	fGapActual			: LREAL;	// how far Mover 2 is behind Mover 1 right now (along the track)
+	fGapWanted			: LREAL;	// what the two tables asked for at coupling time
+	fBallPos			: LREAL;	// where the ball is on its path in this lap (0..fBallLap, 0 = above track position 0)
+	fMasterInTable		: LREAL;	// ball position handed to the NC at start-up, in the table's master range
+	fAlignError			: LREAL;	// where table 3 wanted Mover 1 minus where it is, after AlignMaster (expect 0)
+	fRatioMover1		: LREAL;	// Mover 1 speed / ball speed right now (1 on the straights, 0.56 in the arcs)
+	fRatioMover2		: LREAL;	// Mover 2 speed / ball speed right now
+	bError				: BOOL;
+	nErrorID			: UDINT;
+	sTableError			: STRING(255);	// why the builder refused (nErrorID = PLC_ERROR_ID)
+END_VAR
+]]></Declaration>
+    <Implementation>
+      <ST><![CDATA[// update axis status every cycle
+GVL_Axes.Mover1();
+GVL_Axes.Mover2();
+GVL_Axes.VirtualMaster();
+
+// live gap: Mover 1 position minus Mover 2 position, wrapped to 0..1500
+fMover1Pos := GVL_Axes.Mover1.NcToPlc.ModuloSetPos;
+fMover2Pos := GVL_Axes.Mover2.NcToPlc.ModuloSetPos;
+fGapActual := fMover1Pos - fMover2Pos;
+IF fGapActual < 0.0 THEN
+	fGapActual := fGapActual + TRACK_LENGTH;
+END_IF
+
+// the virtual master is a linear axis (no modulo): wrap its position to one lap of the ball for display
+IF fBallLap > 0.0 THEN
+	fBallPos := GVL_Axes.VirtualMaster.NcToPlc.SetPos;
+	fBallPos := fBallPos - fBallLap * DINT_TO_LREAL(TRUNC(fBallPos / fBallLap));
+	IF fBallPos < 0.0 THEN
+		fBallPos := fBallPos + fBallLap;
+	END_IF
+END_IF
+
+// speed of each mover relative to the ball
+IF ABS(GVL_Axes.VirtualMaster.NcToPlc.SetVelo) > 1.0 THEN
+	fRatioMover1 := GVL_Axes.Mover1.NcToPlc.SetVelo / GVL_Axes.VirtualMaster.NcToPlc.SetVelo;
+	fRatioMover2 := GVL_Axes.Mover2.NcToPlc.SetVelo / GVL_Axes.VirtualMaster.NcToPlc.SetVelo;
+ELSE
+	fRatioMover1 := 0.0;
+	fRatioMover2 := 0.0;
+END_IF
+
+CASE eState OF
+	E_State.Idle:
+		IF bStart THEN
+			bStart := FALSE;
+			eState := E_State.Enable;
+		END_IF
+
+	E_State.Enable:
+		fbPowerMover1.Enable := TRUE;
+		fbPowerMover1.Enable_Positive := TRUE;
+		fbPowerMover1.Enable_Negative := TRUE;
+		fbPowerMover2.Enable := TRUE;
+		fbPowerMover2.Enable_Positive := TRUE;
+		fbPowerMover2.Enable_Negative := TRUE;
+		fbPowerMaster.Enable := TRUE;
+		fbPowerMaster.Enable_Positive := TRUE;
+		fbPowerMaster.Enable_Negative := TRUE;
+		IF fbPowerMover1.Status AND fbPowerMover2.Status AND fbPowerMaster.Status THEN
+			eState := E_State.Decouple;
+		END_IF
+
+	E_State.Decouple:
+		// An earlier run may have left a mover coupled: the NC keeps the coupling through an axis error and MC_Reset
+		// does not clear it. MC_CamTableSelect refuses to overwrite a table that a coupled axis is using (0x4A26).
+		IF NOT fbCamOutMover1.Execute AND NOT fbCamOutMover2.Execute THEN
+			IF GVL_Axes.Mover1.Status.Coupled OR GVL_Axes.Mover2.Status.Coupled THEN
+				fbCamOutMover1.Execute := GVL_Axes.Mover1.Status.Coupled;
+				fbCamOutMover2.Execute := GVL_Axes.Mover2.Status.Coupled;
+			ELSE
+				eState := E_State.BuildTable;
+			END_IF
+		ELSIF (NOT fbCamOutMover1.Execute OR fbCamOutMover1.Done) AND (NOT fbCamOutMover2.Execute OR fbCamOutMover2.Done) THEN
+			fbCamOutMover1.Execute := FALSE;
+			fbCamOutMover2.Execute := FALSE;
+			eState := E_State.BuildTable;
+		END_IF
+
+	E_State.BuildTable:
+		// fill both point arrays once, then hand Mover 1's table to the NC (overwrites cam table MOVER1_TABLE_ID)
+		IF NOT fbTableSelectMover1.Execute THEN
+			BuildTable();
+		END_IF
+		IF bTablesOk THEN		// FALSE: the builder refused, the error check below picks up sTableError
+			fbTableSelectMover1.Periodic := TRUE;		// one table = one lap of the ball, repeat forever
+			fbTableSelectMover1.CamTableID := MOVER1_TABLE_ID;
+			fbTableSelectMover1.Execute := TRUE;
+			IF fbTableSelectMover1.Done THEN
+				fbTableSelectMover1.Execute := FALSE;
+				eState := E_State.LoadMover2Table;
+			END_IF
+		END_IF
+
+	E_State.LoadMover2Table:
+		// Mover 2's table goes into the second NC table
+		fbTableSelectMover2.Periodic := TRUE;
+		fbTableSelectMover2.CamTableID := MOVER2_TABLE_ID;
+		fbTableSelectMover2.Execute := TRUE;
+		IF fbTableSelectMover2.Done THEN
+			fbTableSelectMover2.Execute := FALSE;
+			eState := E_State.AlignMaster;
+		END_IF
+
+	E_State.AlignMaster:
+		// Mover 1 stays where it is. The virtual master has no idea where the ball is, so tell it: Mover 1's jaw is at
+		// track position fMover1Pos, which is BallArc(fMover1Pos) along the ball's path, and the ball itself is half a
+		// ball distance behind the jaw. A value below the table start is one lap further on in the table.
+		IF NOT fbSetMasterPos.Execute THEN
+			fMasterInTable := fbBuilder.BallArc(fMover1Pos) - BALL_DISTANCE / 2.0;
+			IF fMasterInTable < fTableMasterStart THEN
+				fMasterInTable := fMasterInTable + fBallLap;
+			END_IF
+			fbSetMasterPos.Position := fMasterInTable;
+			fbSetMasterPos.Mode := FALSE;		// absolute
+		END_IF
+		fbSetMasterPos.Execute := TRUE;
+		IF fbSetMasterPos.Done THEN
+			fbSetMasterPos.Execute := FALSE;
+			eState := E_State.ReadTable;
+		END_IF
+
+	E_State.ReadTable:
+		// Ask the NC where both tables want their mover for this ball position, one table after the other.
+		// Table 3 should want Mover 1 exactly where it is (fAlignError = 0). Table 4 says where Mover 2 has to go.
+		fbReadTableMover1.CamTableID := MOVER1_TABLE_ID;
+		fbReadTableMover1.MasterPosition := fMasterInTable;
+		fbReadTableMover1.Execute := TRUE;
+		IF fbReadTableMover1.Done THEN
+			fbReadTableMover2.CamTableID := MOVER2_TABLE_ID;
+			fbReadTableMover2.MasterPosition := fMasterInTable;
+			fbReadTableMover2.Execute := TRUE;
+			IF fbReadTableMover2.Done THEN
+				fbReadTableMover1.Execute := FALSE;
+				fbReadTableMover2.Execute := FALSE;
+				// both slave positions are track positions in the same lap, so their difference is the gap
+				fGapWanted := fbReadTableMover1.SlavePosition - fbReadTableMover2.SlavePosition;
+				// self-check: table 3 minus Mover 1, wrapped to -750..750 (whole laps do not count)
+				fAlignError := fbReadTableMover1.SlavePosition - fMover1Pos;
+				fAlignError := fAlignError - TRACK_LENGTH * DINT_TO_LREAL(TRUNC(fAlignError / TRACK_LENGTH));
+				IF fAlignError > 0.5 * TRACK_LENGTH THEN fAlignError := fAlignError - TRACK_LENGTH; END_IF
+				IF fAlignError < -0.5 * TRACK_LENGTH THEN fAlignError := fAlignError + TRACK_LENGTH; END_IF
+				// Mover 1 stands still, so this relative move can never run into it:
+				// positive = Mover 2 closes up from behind, negative = Mover 2 backs off a little
+				fbMoveRelMover2.Distance := fGapActual - fGapWanted;
+				eState := E_State.Preposition;
+			END_IF
+		END_IF
+
+	E_State.Preposition:
+		fbMoveRelMover2.Velocity := POSITIONING_VELOCITY;
+		fbMoveRelMover2.Execute := TRUE;
+		IF fbMoveRelMover2.Done THEN
+			fbMoveRelMover2.Execute := FALSE;
+			eState := E_State.CamIn;
+		END_IF
+
+	E_State.CamIn:
+		// couple both movers to the virtual master, each through its own table
+		fbCamInMover1.CamTableID := MOVER1_TABLE_ID;
+		fbCamInMover1.StartMode := MC_STARTMODE_ABSOLUTE;		// table master axis = the virtual master's position
+		fbCamInMover1.MasterOffset := 0.0;
+		fbCamInMover1.SlaveOffset := 0.0;
+		fbCamInMover1.MasterScaling := 1.0;
+		fbCamInMover1.SlaveScaling := 1.0;
+		// let the NC pick the slave offsets so that nobody jumps at coupling. After AlignMaster and the pre-positioning
+		// both offsets are 0 (or whole laps), so the two tables apply 1:1 and the curves are where the track has them.
+		fbCamInMover1.Options.SlaveScalingMode := MC_CAMSCALING_AUTOOFFSET;
+		fbCamInMover2.CamTableID := MOVER2_TABLE_ID;
+		fbCamInMover2.StartMode := MC_STARTMODE_ABSOLUTE;
+		fbCamInMover2.MasterOffset := 0.0;
+		fbCamInMover2.SlaveOffset := 0.0;
+		fbCamInMover2.MasterScaling := 1.0;
+		fbCamInMover2.SlaveScaling := 1.0;
+		fbCamInMover2.Options.SlaveScalingMode := MC_CAMSCALING_AUTOOFFSET;
+		fbCamInMover1.Execute := TRUE;
+		fbCamInMover2.Execute := TRUE;
+		IF fbCamInMover1.InSync AND fbCamInMover2.InSync THEN
+			fbCamInMover1.Execute := FALSE;
+			fbCamInMover2.Execute := FALSE;
+			eState := E_State.Run;
+		END_IF
+
+	E_State.Run:
+		// only the ball is commanded - both movers are driven by their cams
+		fbMoveVeloMaster.Velocity := MASTER_VELOCITY;
+		fbMoveVeloMaster.Direction := MC_Positive_Direction;
+		fbMoveVeloMaster.Execute := TRUE;
+		IF bStop THEN
+			bStop := FALSE;
+			fbMoveVeloMaster.Execute := FALSE;
+			eState := E_State.Stopping;
+		END_IF
+
+	E_State.Stopping:
+		fbHaltMaster.Execute := TRUE;
+		IF fbHaltMaster.Done THEN
+			fbHaltMaster.Execute := FALSE;
+			eState := E_State.CamOut;
+		END_IF
+
+	E_State.CamOut:
+		fbCamOutMover1.Execute := TRUE;
+		fbCamOutMover2.Execute := TRUE;
+		IF fbCamOutMover1.Done AND fbCamOutMover2.Done THEN
+			fbCamOutMover1.Execute := FALSE;
+			fbCamOutMover2.Execute := FALSE;
+			eState := E_State.Idle;
+		END_IF
+
+	E_State.Error:
+		fbTableSelectMover1.Execute := FALSE;
+		fbTableSelectMover2.Execute := FALSE;
+		fbSetMasterPos.Execute := FALSE;
+		fbReadTableMover1.Execute := FALSE;
+		fbReadTableMover2.Execute := FALSE;
+		fbMoveRelMover2.Execute := FALSE;
+		fbCamInMover1.Execute := FALSE;
+		fbCamInMover2.Execute := FALSE;
+		fbMoveVeloMaster.Execute := FALSE;
+		// a slave error does not stop the master: halt the virtual master if it is still running and not in error itself
+		fbHaltMaster.Execute := NOT GVL_Axes.VirtualMaster.Status.Error AND GVL_Axes.VirtualMaster.Status.Moving;
+		fbCamOutMover1.Execute := FALSE;
+		fbCamOutMover2.Execute := FALSE;
+		IF bReset THEN
+			bReset := FALSE;
+			fbResetMover1.Execute := TRUE;
+			fbResetMover2.Execute := TRUE;
+			fbResetMaster.Execute := TRUE;
+			eState := E_State.Resetting;
+		END_IF
+
+	E_State.Resetting:
+		IF (fbResetMover1.Done OR fbResetMover1.Error) AND (fbResetMover2.Done OR fbResetMover2.Error)
+			AND (fbResetMaster.Done OR fbResetMaster.Error) THEN
+			fbResetMover1.Execute := FALSE;
+			fbResetMover2.Execute := FALSE;
+			fbResetMaster.Execute := FALSE;
+			bError := FALSE;
+			nErrorID := 0;
+			sTableError := '';
+			eState := E_State.Idle;
+		END_IF
+END_CASE
+
+// any error anywhere -> Error state
+IF eState <> E_State.Error AND eState <> E_State.Resetting THEN
+	IF GVL_Axes.Mover1.Status.Error THEN
+		nErrorID := GVL_Axes.Mover1.Status.ErrorID;
+	ELSIF GVL_Axes.Mover2.Status.Error THEN
+		nErrorID := GVL_Axes.Mover2.Status.ErrorID;
+	ELSIF GVL_Axes.VirtualMaster.Status.Error THEN
+		nErrorID := GVL_Axes.VirtualMaster.Status.ErrorID;
+	ELSIF fbPowerMover1.Error THEN
+		nErrorID := fbPowerMover1.ErrorID;
+	ELSIF fbPowerMover2.Error THEN
+		nErrorID := fbPowerMover2.ErrorID;
+	ELSIF fbPowerMaster.Error THEN
+		nErrorID := fbPowerMaster.ErrorID;
+	ELSIF sTableError <> '' THEN
+		nErrorID := PLC_ERROR_ID;
+	ELSIF fbTableSelectMover1.Error THEN
+		nErrorID := fbTableSelectMover1.ErrorID;
+	ELSIF fbTableSelectMover2.Error THEN
+		nErrorID := fbTableSelectMover2.ErrorID;
+	ELSIF fbSetMasterPos.Error THEN
+		nErrorID := fbSetMasterPos.ErrorID;
+	ELSIF fbReadTableMover1.Error THEN
+		nErrorID := fbReadTableMover1.ErrorID;
+	ELSIF fbReadTableMover2.Error THEN
+		nErrorID := fbReadTableMover2.ErrorID;
+	ELSIF fbMoveRelMover2.Error THEN
+		nErrorID := fbMoveRelMover2.ErrorID;
+	ELSIF fbCamInMover1.Error THEN
+		nErrorID := fbCamInMover1.ErrorID;
+	ELSIF fbCamInMover2.Error THEN
+		nErrorID := fbCamInMover2.ErrorID;
+	ELSIF fbMoveVeloMaster.Error THEN
+		nErrorID := fbMoveVeloMaster.ErrorID;
+	ELSIF fbHaltMaster.Error THEN
+		nErrorID := fbHaltMaster.ErrorID;
+	ELSIF fbCamOutMover1.Error THEN
+		nErrorID := fbCamOutMover1.ErrorID;
+	ELSIF fbCamOutMover2.Error THEN
+		nErrorID := fbCamOutMover2.ErrorID;
+	END_IF
+	IF nErrorID <> 0 THEN
+		bError := TRUE;
+		eState := E_State.Error;
+	END_IF
+END_IF
+
+// call every function block once per cycle
+fbPowerMover1(Axis := GVL_Axes.Mover1);
+fbPowerMover2(Axis := GVL_Axes.Mover2);
+fbPowerMaster(Axis := GVL_Axes.VirtualMaster);
+fbResetMover1(Axis := GVL_Axes.Mover1);
+fbResetMover2(Axis := GVL_Axes.Mover2);
+fbResetMaster(Axis := GVL_Axes.VirtualMaster);
+fbTableSelectMover1(Master := GVL_Axes.VirtualMaster, Slave := GVL_Axes.Mover1, CamTable := stMover1Table);
+fbTableSelectMover2(Master := GVL_Axes.VirtualMaster, Slave := GVL_Axes.Mover2, CamTable := stMover2Table);
+fbSetMasterPos(Axis := GVL_Axes.VirtualMaster);
+fbReadTableMover1();
+fbReadTableMover2();
+fbMoveRelMover2(Axis := GVL_Axes.Mover2);
+fbCamInMover1(Master := GVL_Axes.VirtualMaster, Slave := GVL_Axes.Mover1);
+fbCamInMover2(Master := GVL_Axes.VirtualMaster, Slave := GVL_Axes.Mover2);
+fbMoveVeloMaster(Axis := GVL_Axes.VirtualMaster);
+fbHaltMaster(Axis := GVL_Axes.VirtualMaster);
+fbCamOutMover1(Slave := GVL_Axes.Mover1);
+fbCamOutMover2(Slave := GVL_Axes.Mover2);
+]]></ST>
+    </Implementation>
+    <Action Name="BuildTable" Id="{05608d38-ccd4-438b-bbd5-27b8c7a8f5ee}">
+      <Implementation>
+        <ST><![CDATA[// Two tables with the same master: the ball. Master = distance the ball has travelled along its own path.
+//   table MOVER1_TABLE_ID (3): where Mover 1 has to be so that its jaw is BALL_DISTANCE/2 AHEAD of the ball on that path.
+//   table MOVER2_TABLE_ID (4): where Mover 2 has to be so that its jaw is BALL_DISTANCE/2 BEHIND the ball.
+// The jaws are then BALL_DISTANCE apart along the ball's path, exactly as in example 2. Only the master changed:
+// there it was Mover 1 (constant speed, Mover 2 did all the adjusting), here it is the ball.
+//
+// FB_XtsBallCamBuilder.BuildBallMaster does the geometry per mover: on a straight the mover runs at the ball's
+// speed; while its jaw is in a curve module the ball's path (BALL_OFFSET outboard) is longer than the mover's, so
+// the mover runs at 1/1.78 = 56 % of the ball's speed. The change happens exactly while the jaw is in the module's
+// curvature ramp (84 mm of track), which is where the builder puts its knots: 4 points per curve (POLYNOM5 ramp,
+// line on the arc, POLYNOM5 ramp, line on the straight) plus one point at each end = 10 points. No tuned knots.
+//
+// Both tables cover one lap of the track, from ball position TABLE_START (the ball is still on straight 1 there,
+// so its path position equals the track position) to TABLE_START + fBallLap. Slave lift per lap: 1500, so the
+// movers keep going around ("cyclic cam with lift").
+sTableError := '';
+bTablesOk := FALSE;
+nMover1Points := 0;
+nMover2Points := 0;
+
+fbBuilder.fMasterStart		:= TABLE_START;
+fbBuilder.fMasterEnd		:= TABLE_START + TRACK_LENGTH;
+fbBuilder.fBallDistance		:= BALL_DISTANCE;
+fbBuilder.fBallOffset		:= BALL_OFFSET;
+fbBuilder.nCurves			:= 2;
+fbBuilder.aCurveStart[1]	:= CURVE_1_START;
+fbBuilder.aCurveStart[2]	:= CURVE_2_START;
+fbBuilder.fModuleLength		:= MODULE_LENGTH;
+// fTransLength keeps the FB default (84 mm, the AT2050 curvature ramp). The tuned knots are not used here.
+fbBuilder.nMaxPoints		:= MAX_CAM_POINTS;
+
+// table 3: Mover 1, jaw half a ball distance ahead of the ball
+fbBuilder.pPoints := ADR(aMover1Points);
+IF NOT fbBuilder.BuildBallMaster(fJawLead := BALL_DISTANCE / 2.0) THEN
+	sTableError := fbBuilder.sError;
+	RETURN;
+END_IF
+nMover1Points := fbBuilder.nPoints;		// 10
+
+// table 4: Mover 2, jaw half a ball distance behind the ball
+fbBuilder.pPoints := ADR(aMover2Points);
+IF NOT fbBuilder.BuildBallMaster(fJawLead := -BALL_DISTANCE / 2.0) THEN
+	sTableError := fbBuilder.sError;
+	RETURN;
+END_IF
+nMover2Points := fbBuilder.nPoints;		// 10
+
+// master range of the tables: one lap of the ball = 1500 + 2 pi * 103.03 = 2147.36 mm
+fTableMasterStart	:= fbBuilder.BallArc(TABLE_START);
+fBallLap			:= fbBuilder.BallArc(TABLE_START + TRACK_LENGTH) - fTableMasterStart;
+
+// describe both arrays to the NC
+stMover1Table.pArray		:= ADR(aMover1Points);
+stMover1Table.ArraySize		:= nMover1Points * SIZEOF(MC_MotionFunctionPoint);
+stMover1Table.TableType		:= MC_TABLETYPE_MOTIONFUNCTION;
+stMover1Table.NoOfRows		:= nMover1Points;
+stMover1Table.NoOfColumns	:= 1;
+
+stMover2Table.pArray		:= ADR(aMover2Points);
+stMover2Table.ArraySize		:= nMover2Points * SIZEOF(MC_MotionFunctionPoint);
+stMover2Table.TableType		:= MC_TABLETYPE_MOTIONFUNCTION;
+stMover2Table.NoOfRows		:= nMover2Points;
+stMover2Table.NoOfColumns	:= 1;
+
+bTablesOk := TRUE;
+]]></ST>
+      </Implementation>
+    </Action>
+  </POU>
+</TcPlcObject>

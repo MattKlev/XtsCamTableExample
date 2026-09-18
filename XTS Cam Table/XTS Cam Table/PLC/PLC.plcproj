@@ -60,6 +60,9 @@
     <Compile Include="POUs\PRG_Example4.TcPOU">
       <SubType>Code</SubType>
     </Compile>
+    <Compile Include="POUs\PRG_Example5.TcPOU">
+      <SubType>Code</SubType>
+    </Compile>
     <Compile Include="GVLs\GVL_Axes.TcGVL">
       <SubType>Code</SubType>
     </Compile>

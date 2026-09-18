@@ -31,7 +31,7 @@ VAR CONSTANT
 	MASTER_VELOCITY			: LREAL := 300.0;	// mm/s, Mover 1 while running
 	POSITIONING_VELOCITY	: LREAL := 200.0;	// mm/s, Mover 2 while pre-positioning
 
-	CAM_TABLE_ID			: MC_CAM_ID := 1;	// NC > Tables > Master 1 > Slave 1
+	CAM_TABLE_ID			: MC_CAM_ID := 1;	// NC > Tables > Table 1 (Ex 1-4) > Mover 2
 	MAX_CAM_POINTS			: UDINT := 32;		// the builder writes 8 per curve + 2 = 18, the rest is room for tuning
 	PLC_ERROR_ID			: UDINT := 16#FFFF_FFFF;	// not an NC error: the builder refused, see sTableError
 END_VAR
@@ -100,6 +100,20 @@ CASE eState OF
 		fbPowerMover2.Enable_Positive := TRUE;
 		fbPowerMover2.Enable_Negative := TRUE;
 		IF fbPowerMover1.Status AND fbPowerMover2.Status THEN
+			eState := E_State.Decouple;
+		END_IF
+
+	E_State.Decouple:
+		// An earlier run may have left Mover 2 coupled: the NC keeps the coupling through an axis error and MC_Reset
+		// does not clear it. MC_CamTableSelect refuses to overwrite a table that a coupled axis is using (0x4A26).
+		IF NOT fbCamOut.Execute THEN
+			IF GVL_Axes.Mover2.Status.Coupled THEN
+				fbCamOut.Execute := TRUE;
+			ELSE
+				eState := E_State.BuildTable;
+			END_IF
+		ELSIF fbCamOut.Done THEN
+			fbCamOut.Execute := FALSE;
 			eState := E_State.BuildTable;
 		END_IF
 
@@ -196,7 +210,8 @@ CASE eState OF
 		fbMoveRelMover2.Execute := FALSE;
 		fbCamIn.Execute := FALSE;
 		fbMoveVeloMover1.Execute := FALSE;
-		fbHaltMover1.Execute := FALSE;
+		// a slave error does not stop the master: halt Mover 1 if it is still running and not in error itself
+		fbHaltMover1.Execute := NOT GVL_Axes.Mover1.Status.Error AND GVL_Axes.Mover1.Status.Moving;
 		fbCamOut.Execute := FALSE;
 		IF bReset THEN
 			bReset := FALSE;

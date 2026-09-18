@@ -1,21 +1,25 @@
 ﻿<?xml version="1.0" encoding="utf-8"?>
 <TcPlcObject Version="1.1.0.1">
   <DUT Name="E_State" Id="{84637ff5-a0c4-42fe-8352-3df8751e49a1}">
-    <Declaration><![CDATA[// Steps of the demo sequence, shared by the example programs PRG_Example1..4
+    <Declaration><![CDATA[// Steps of the demo sequence, shared by the example programs PRG_Example1..5
 TYPE E_State :
 (
 	Idle,			// waiting for bStart
-	Enable,			// MC_Power on both movers
-	BuildTable,		// fill the point array and load it into NC cam table 1 (MC_CamTableSelect)
+	Enable,			// MC_Power on both movers (PRG_Example5: and on the virtual master)
+	Decouple,		// MC_CamOut on a slave that is still coupled from an earlier run. The NC keeps a cam coupling through
+					// an axis error and MC_Reset does not clear it; MC_CamTableSelect would then refuse the table (0x4A26)
+	BuildTable,		// fill the point array(s) and load the first table into the NC (MC_CamTableSelect)
 	BuildCurveTable,// PRG_Example4 only: load the clothoid piece into NC cam table 2
-	ReadTable,		// ask the NC where the table wants Mover 2 for Mover 1's current position
+	LoadMover2Table,// PRG_Example5 only: load Mover 2's table into NC cam table 4 (Mover 1's went into table 3 in BuildTable)
+	AlignMaster,	// PRG_Example5 only: MC_SetPosition puts the virtual master (the ball) where it belongs for Mover 1's position
+	ReadTable,		// ask the NC where the table wants Mover 2 for the master's current position
 	Preposition,	// move Mover 2 there (MC_MoveRelative, Mover 1 stands still)
-	CamIn,			// couple Mover 2 to Mover 1 (MC_CamIn)
-	Run,			// Mover 1 runs at constant velocity, Mover 2 follows the cam
-	Stopping,		// MC_Halt on Mover 1 (Mover 2 follows it to a stop)
+	CamIn,			// couple the slave(s) to the master (MC_CamIn)
+	Run,			// the master runs at constant velocity, the slave(s) follow the cam
+	Stopping,		// MC_Halt on the master (the slaves follow it to a stop)
 	CamOut,			// decouple (MC_CamOut)
 	Error,			// something failed - set bReset
-	Resetting		// MC_Reset on both movers
+	Resetting		// MC_Reset on all axes
 );
 END_TYPE
 ]]></Declaration>

@@ -11,8 +11,11 @@ TYPE E_Example :
 						// (FB_XtsBallCamBuilder)
 	StitchedSegments,	// PRG_Example3: the same 18 points, assembled from a track layout and ONE module-relative
 						// clothoid piece (FB_XtsCamStitcher)
-	TwoTableSwitching	// PRG_Example4: two NC tables, a 2-point straight line and the 10-point clothoid piece. The NC
+	TwoTableSwitching,	// PRG_Example4: two NC tables, a 2-point straight line and the 10-point clothoid piece. The NC
 						// swaps them at the curve boundaries while running
+	VirtualMasterSplit	// PRG_Example5: the BALL is the master. A virtual axis runs along the ball's path at constant
+						// speed and both movers follow it through their own 10-point table, so the curve work of
+						// example 2 is split between them and neither ever runs faster than the ball
 );
 END_TYPE
 ]]></Declaration>

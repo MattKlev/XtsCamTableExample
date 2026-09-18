@@ -9,7 +9,12 @@
    Layout per module: entry ramp up (POLYNOM3) - plateau (POLYNOM1) - ramp down (POLYNOM3) - line (POLYNOM1)
                       exit  ramp down (POLYNOM3) - plateau (POLYNOM1) - ramp up (POLYNOM3) - line (POLYNOM1)
    All SlaveVelo/SlaveAcc/SlaveJerk = 0 -> TwinCAT takes the ramp end velocities from the adjacent lines.
-   Generated 2026-09-16 from cam_M180-1680_D115_clothoid_xlsx_min18_p3_std. *)
+   Generated 2026-09-16 from cam_M180-1680_D115_clothoid_xlsx_min18_p3_std.
+
+   Second use, BuildBallMaster() (example 5): the BALL is the master. Master = distance the ball has travelled
+   along its own path, slave = one mover whose jaw sits fJawLead ahead of the ball on that path. 4 points per
+   module (POLYNOM5 ramp - arc line - POLYNOM5 ramp - straight line), placed exactly where that mover's jaw enters
+   and leaves the curvature ramps. No tuned knots. BallArc() / InvBallArc() are public for the same reason. *)
 VAR_INPUT
 	// ---- cam table range ----
 	fMasterStart		: LREAL := 180.0;		// [mm] master position of the first point
@@ -53,8 +58,21 @@ END_VAR]]></Declaration>
     </Implementation>
     <Method Name="AddPoint" Id="{ca6de93c-4fc6-4571-b9b4-e85abb2af8d6}">
       <Declaration><![CDATA[METHOD PRIVATE AddPoint
+(* one point of the mover-master table (Build): master = leading mover, slave = trailing mover *)
 VAR_INPUT
 	fMaster	: LREAL;
+	eFunc	: MC_MotionFunctionType;
+END_VAR]]></Declaration>
+      <Implementation>
+        <ST><![CDATA[AddPointXY(fMaster, SlavePos(fMaster), eFunc);]]></ST>
+      </Implementation>
+    </Method>
+    <Method Name="AddPointXY" Id="{64305d93-cfe0-4862-b57f-8cb75c83790f}">
+      <Declaration><![CDATA[METHOD PRIVATE AddPointXY
+(* writes one point with an explicit slave position *)
+VAR_INPUT
+	fMaster	: LREAL;
+	fSlave	: LREAL;
 	eFunc	: MC_MotionFunctionType;
 END_VAR]]></Declaration>
       <Implementation>
@@ -68,7 +86,7 @@ END_IF
 
 pPoints[nPoints].PointIndex        := nPoints + 1;
 pPoints[nPoints].MasterPos         := fMaster;
-pPoints[nPoints].SlavePos          := SlavePos(fMaster);
+pPoints[nPoints].SlavePos          := fSlave;
 pPoints[nPoints].FunctionType      := eFunc;
 pPoints[nPoints].PointType         := SEL(nPoints = 0, MC_MotionPointType.MOTIONPOINTTYPE_MOTION, MC_MotionPointType.MOTIONPOINTTYPE_ACTIVATION);
 pPoints[nPoints].RelIndexNextPoint := 1;
@@ -79,8 +97,9 @@ nPoints := nPoints + 1;]]></ST>
       </Implementation>
     </Method>
     <Method Name="BallArc" Id="{302181b7-f8d4-4a52-9ad2-83d2a0cb150d}">
-      <Declaration><![CDATA[METHOD PRIVATE BallArc : LREAL
-(* path length of the ball for mover position fS: B(s) = s + d * theta(s) *)
+      <Declaration><![CDATA[METHOD BallArc : LREAL
+(* distance the ball has travelled along its own path when the mover (its jaw) is at track position fS:
+   B(s) = s + d * theta(s). Equal to s on the straight before the first module, longer after every bend. *)
 VAR_INPUT
 	fS	: LREAL;
 END_VAR]]></Declaration>
@@ -145,9 +164,79 @@ END_IF
 Build := NOT bError;]]></ST>
       </Implementation>
     </Method>
+    <Method Name="BuildBallMaster" Id="{27f91627-dd79-4777-9df0-5a6a217e6b40}">
+      <Declaration><![CDATA[METHOD BuildBallMaster : BOOL
+(* Cam table for a master that is the BALL, for ONE of the two movers (call it twice, once per mover).
+   Master = distance the ball has travelled along its own path [mm]. The table covers one lap of the track,
+            BallArc(fMasterStart) .. BallArc(fMasterEnd); its period is the track length + 2 pi * fBallOffset.
+   Slave  = track position of the mover whose jaw sits fJawLead mm AHEAD of the ball along the ball's path:
+            +fBallDistance/2 for the leading mover, -fBallDistance/2 for the trailing one.
+   On a straight the mover runs at the ball's speed (ratio 1). While its jaw is in an arc the ball travels further
+   than the mover, so the mover runs at 1/fPeakRatio. The change happens exactly while the jaw is in a curvature
+   ramp of the module, so the knots are the ramp ends and need no tuning: 4 points per module + 2.
+   Ramps are POLYNOM5 between two lines: position and velocity from the lines, acceleration 0 at both ends,
+   as in the true profile. Both movers get the same curve, shifted by fBallDistance along the master. *)
+VAR_INPUT
+	fJawLead	: LREAL;		// [mm] jaw position ahead of the ball along the ball's path (negative = behind)
+END_VAR
+VAR
+	nCurve	: UINT;
+	fC		: LREAL;
+END_VAR]]></Declaration>
+      <Implementation>
+        <ST><![CDATA[bError := FALSE; sError := ''; nPoints := 0;
+
+IF pPoints = 0 OR nMaxPoints < 2 THEN
+	bError := TRUE; sError := 'pPoints / nMaxPoints not set'; RETURN;
+END_IF
+IF nCurves < 1 OR nCurves > 4 THEN
+	bError := TRUE; sError := 'nCurves must be 1..4'; RETURN;
+END_IF
+IF fTransLength <= 0 OR fTransLength >= 0.5 * fModuleLength THEN
+	bError := TRUE; sError := 'fTransLength out of range'; RETURN;
+END_IF
+
+fKMax      := fPI / (fModuleLength - fTransLength);
+fArcRadius := 1.0 / fKMax;
+fPeakRatio := 1.0 + fBallOffset * fKMax;
+
+// ---- first point: on the straight, ratio 1 ----
+AddBallPoint(BallArc(fMasterStart), fJawLead, MC_MotionFunctionType.MOTIONFUNCTYPE_POLYNOM1);
+
+// ---- per module: the jaw enters the ramp (slow down), rides the arc, enters the exit ramp (speed up), is out ----
+FOR nCurve := 1 TO nCurves DO
+	fC := aCurveStart[nCurve];
+	AddBallPoint(BallArc(fC) - fJawLead,                             fJawLead, MC_MotionFunctionType.MOTIONFUNCTYPE_POLYNOM5);	// ratio 1 -> 1/peak
+	AddBallPoint(BallArc(fC + fTransLength) - fJawLead,              fJawLead, MC_MotionFunctionType.MOTIONFUNCTYPE_POLYNOM1);	// on the arc: 1/peak
+	AddBallPoint(BallArc(fC + fModuleLength - fTransLength) - fJawLead, fJawLead, MC_MotionFunctionType.MOTIONFUNCTYPE_POLYNOM5);	// 1/peak -> 1
+	AddBallPoint(BallArc(fC + fModuleLength) - fJawLead,             fJawLead, MC_MotionFunctionType.MOTIONFUNCTYPE_POLYNOM1);	// on the straight: 1
+END_FOR
+
+// ---- last point ----
+AddBallPoint(BallArc(fMasterEnd), fJawLead, MC_MotionFunctionType.MOTIONFUNCTYPE_POLYNOM1);
+
+IF NOT bError THEN
+	pPoints[nPoints - 1].RelIndexNextPoint := 0;	// terminate the table
+END_IF
+BuildBallMaster := NOT bError;]]></ST>
+      </Implementation>
+    </Method>
+    <Method Name="AddBallPoint" Id="{87e354ca-8901-4827-a058-52ca5a38ccfa}">
+      <Declaration><![CDATA[METHOD PRIVATE AddBallPoint
+(* one point of a ball-master table (BuildBallMaster): master = ball path position, slave = the mover whose jaw
+   is fJawLead ahead of the ball on that path *)
+VAR_INPUT
+	fBallPos	: LREAL;
+	fJawLead	: LREAL;
+	eFunc		: MC_MotionFunctionType;
+END_VAR]]></Declaration>
+      <Implementation>
+        <ST><![CDATA[AddPointXY(fBallPos, InvBallArc(fBallPos + fJawLead), eFunc);]]></ST>
+      </Implementation>
+    </Method>
     <Method Name="InvBallArc" Id="{31b59390-af40-4b73-af0c-a9c7121ceb99}">
-      <Declaration><![CDATA[METHOD PRIVATE InvBallArc : LREAL
-(* mover position for a ball path length: Newton iteration on B(s) = fB *)
+      <Declaration><![CDATA[METHOD InvBallArc : LREAL
+(* the inverse of BallArc: mover (jaw) track position for a ball path length. Newton iteration on B(s) = fB *)
 VAR_INPUT
 	fB	: LREAL;
 END_VAR

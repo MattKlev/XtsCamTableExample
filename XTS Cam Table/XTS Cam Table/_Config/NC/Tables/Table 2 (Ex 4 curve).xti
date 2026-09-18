@@ -1,8 +1,8 @@
 <?xml version="1.0"?>
 <TcSmItem xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:noNamespaceSchemaLocation="http://www.beckhoff.com/schemas/2012/07/TcSmProject" TcSmVersion="1.0" TcVersion="3.1.4026.27" ClassName="CNcTableDef">
-	<Table Id="1" AxisId="1" Axisrotational="true" MotionFunction="true" Maximum="1500" MinIncr="1" Velocity="1" RoundValue="0.001" VelScale="1">
+	<Table Id="2" AxisId="1" Axisrotational="true" MotionFunction="true" Maximum="1500" MinIncr="1" Velocity="1" RoundValue="0.001" VelScale="1">
 		<Name>__FILENAME__</Name>
 		<ImageId>137</ImageId>
-		<Slave File="Slave 1.xti"/>
+		<Slave File="Mover 2.xti"/>
 	</Table>
 </TcSmItem>
