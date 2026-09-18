@@ -1,0 +1,270 @@
+﻿<?xml version="1.0" encoding="utf-8"?>
+<TcPlcObject Version="1.1.0.1">
+  <POU Name="FB_XtsBallCamBuilder" Id="{a03eda8c-4ede-42f2-a813-b4f495638e46}" SpecialFunc="None">
+    <Declaration><![CDATA[FUNCTION_BLOCK FB_XtsBallCamBuilder
+(* Builds a TwinCAT motion-function cam table (MC_MotionFunctionPoint array) for two XTS movers that
+   must keep a constant distance measured along the path of a ball mounted outward of the mover path.
+   Track: straights and 180 deg modules (Beckhoff AT2050 geometry: quintic curvature ramp + circular arc).
+   Layout per module: entry ramp up (POLYNOM3) - plateau (POLYNOM1) - ramp down (POLYNOM3) - line (POLYNOM1)
+                      exit  ramp down (POLYNOM3) - plateau (POLYNOM1) - ramp up (POLYNOM3) - line (POLYNOM1)
+   All SlaveVelo/SlaveAcc/SlaveJerk = 0 -> TwinCAT takes the ramp end velocities from the adjacent lines.
+   Generated 2026-09-16 from cam_M180-1680_D115_clothoid_xlsx_min18_p3_std. *)
+VAR_INPUT
+	// ---- cam table range ----
+	fMasterStart		: LREAL := 180.0;		// [mm] master position of the first point
+	fMasterEnd			: LREAL := 1680.0;		// [mm] master position of the last point
+	fBallDistance		: LREAL := 115.0;		// [mm] distance master ball -> slave ball along the ball path (slave trails the master)
+
+	// ---- track layout in master coordinates ----
+	nCurves				: UINT  := 2;			// number of 180 deg modules inside the table range
+	aCurveStart			: ARRAY[1..4] OF LREAL := [250.0, 1000.0, 0.0, 0.0];	// [mm] start of each module
+	fModuleLength		: LREAL := 500.0;		// [mm] module length along the mover path (AT2050: 500)
+	fTransLength		: LREAL := 84.0;		// [mm] curvature transition length at each module end (quintic ramp)
+	fBallOffset			: LREAL := 103.03;		// [mm] lateral offset of the ball, outward of the mover path (r_ball - r_xts)
+
+	// ---- knot layout, offsets relative to the module start [mm] (optimised for D = 115 mm, offset 103 mm) ----
+	aEntryKnots			: ARRAY[1..4] OF LREAL := [16.0, 67.5, 90.5, 134.7];	// ramp start, plateau start, plateau end, ramp end
+	aExitKnots			: ARRAY[1..4] OF LREAL := [432.0, 483.0, 493.0, 603.0];	// ramp start, plateau start, plateau end, ramp end
+
+	// ---- options ----
+	bZeroEndVelocity	: BOOL  := FALSE;		// TRUE: slave at rest at the first and last point (POLYNOM5 run-up / run-down + link line)
+	fLinkLength			: LREAL := 10.0;		// [mm] POLYNOM1 link between run-up/run-down and the first/last ramp
+
+	// ---- target buffer ----
+	pPoints				: POINTER TO MC_MotionFunctionPoint;	// ADR(camPoints[first element])
+	nMaxPoints			: UDINT;				// number of elements in the buffer
+END_VAR
+VAR_OUTPUT
+	nPoints				: UDINT;				// points written (use as NoOfRows)
+	fArcRadius			: LREAL;				// [mm] radius of the circular middle, derived: (fModuleLength - fTransLength) / PI
+	fPeakRatio			: LREAL;				// max slave/master speed ratio = 1 + fBallOffset / fArcRadius
+	bError				: BOOL;
+	sError				: STRING(255);
+END_VAR
+VAR
+	fKMax				: LREAL;				// [1/mm] curvature of the circular middle
+END_VAR
+VAR CONSTANT
+	fPI					: LREAL := 3.14159265358979;
+END_VAR]]></Declaration>
+    <Implementation>
+      <ST><![CDATA[(* nothing cyclic: call Build() once *)]]></ST>
+    </Implementation>
+    <Method Name="AddPoint" Id="{ca6de93c-4fc6-4571-b9b4-e85abb2af8d6}">
+      <Declaration><![CDATA[METHOD PRIVATE AddPoint
+VAR_INPUT
+	fMaster	: LREAL;
+	eFunc	: MC_MotionFunctionType;
+END_VAR]]></Declaration>
+      <Implementation>
+        <ST><![CDATA[IF bError THEN RETURN; END_IF
+IF nPoints >= nMaxPoints THEN
+	bError := TRUE; sError := 'point buffer too small'; RETURN;
+END_IF
+IF nPoints > 0 AND_THEN fMaster <= pPoints[nPoints - 1].MasterPos THEN
+	bError := TRUE; sError := CONCAT('master positions not increasing at point ', UDINT_TO_STRING(nPoints + 1)); RETURN;
+END_IF
+
+pPoints[nPoints].PointIndex        := nPoints + 1;
+pPoints[nPoints].MasterPos         := fMaster;
+pPoints[nPoints].SlavePos          := SlavePos(fMaster);
+pPoints[nPoints].FunctionType      := eFunc;
+pPoints[nPoints].PointType         := SEL(nPoints = 0, MC_MotionPointType.MOTIONPOINTTYPE_MOTION, MC_MotionPointType.MOTIONPOINTTYPE_ACTIVATION);
+pPoints[nPoints].RelIndexNextPoint := 1;
+pPoints[nPoints].SlaveVelo         := 0.0;
+pPoints[nPoints].SlaveAcc          := 0.0;
+pPoints[nPoints].SlaveJerk         := 0.0;
+nPoints := nPoints + 1;]]></ST>
+      </Implementation>
+    </Method>
+    <Method Name="BallArc" Id="{302181b7-f8d4-4a52-9ad2-83d2a0cb150d}">
+      <Declaration><![CDATA[METHOD PRIVATE BallArc : LREAL
+(* path length of the ball for mover position fS: B(s) = s + d * theta(s) *)
+VAR_INPUT
+	fS	: LREAL;
+END_VAR]]></Declaration>
+      <Implementation>
+        <ST><![CDATA[BallArc := fS + fBallOffset * Theta(fS);]]></ST>
+      </Implementation>
+    </Method>
+    <Method Name="Build" Id="{e852644c-4290-4ee4-bb37-7becfc9c39cf}">
+      <Declaration><![CDATA[METHOD Build : BOOL
+VAR
+	nCurve	: UINT;
+	fC		: LREAL;
+END_VAR]]></Declaration>
+      <Implementation>
+        <ST><![CDATA[bError := FALSE; sError := ''; nPoints := 0;
+
+IF pPoints = 0 OR nMaxPoints < 2 THEN
+	bError := TRUE; sError := 'pPoints / nMaxPoints not set'; RETURN;
+END_IF
+IF nCurves < 1 OR nCurves > 4 THEN
+	bError := TRUE; sError := 'nCurves must be 1..4'; RETURN;
+END_IF
+IF fTransLength <= 0 OR fTransLength >= 0.5 * fModuleLength THEN
+	bError := TRUE; sError := 'fTransLength out of range'; RETURN;
+END_IF
+
+// 180 deg over the module: kmax * (L_mod - L_trans) = PI  (the quintic ramp integrates to half its length)
+fKMax      := fPI / (fModuleLength - fTransLength);
+fArcRadius := 1.0 / fKMax;
+fPeakRatio := 1.0 + fBallOffset * fKMax;
+
+// ---- first point(s) ----
+IF bZeroEndVelocity THEN
+	AddPoint(fMasterStart, MC_MotionFunctionType.MOTIONFUNCTYPE_POLYNOM5);								// run-up from rest
+	AddPoint(aCurveStart[1] + aEntryKnots[1] - fLinkLength, MC_MotionFunctionType.MOTIONFUNCTYPE_POLYNOM1);	// short line
+ELSE
+	AddPoint(fMasterStart, MC_MotionFunctionType.MOTIONFUNCTYPE_POLYNOM1);
+END_IF
+
+// ---- per module: entry (ratio 1 -> peak -> 1) and exit (ratio 1 -> 1/peak -> 1) ----
+FOR nCurve := 1 TO nCurves DO
+	fC := aCurveStart[nCurve];
+	AddPoint(fC + aEntryKnots[1], MC_MotionFunctionType.MOTIONFUNCTYPE_POLYNOM3);	// ramp up
+	AddPoint(fC + aEntryKnots[2], MC_MotionFunctionType.MOTIONFUNCTYPE_POLYNOM1);	// plateau at the ratio maximum
+	AddPoint(fC + aEntryKnots[3], MC_MotionFunctionType.MOTIONFUNCTYPE_POLYNOM3);	// ramp down
+	AddPoint(fC + aEntryKnots[4], MC_MotionFunctionType.MOTIONFUNCTYPE_POLYNOM1);	// both on the arc: ratio 1
+	AddPoint(fC + aExitKnots[1],  MC_MotionFunctionType.MOTIONFUNCTYPE_POLYNOM3);	// ramp down
+	AddPoint(fC + aExitKnots[2],  MC_MotionFunctionType.MOTIONFUNCTYPE_POLYNOM1);	// plateau at the ratio minimum
+	AddPoint(fC + aExitKnots[3],  MC_MotionFunctionType.MOTIONFUNCTYPE_POLYNOM3);	// ramp up
+	AddPoint(fC + aExitKnots[4],  MC_MotionFunctionType.MOTIONFUNCTYPE_POLYNOM1);	// both on the straight: ratio 1
+END_FOR
+
+// ---- last point(s) ----
+IF bZeroEndVelocity THEN
+	AddPoint(aCurveStart[nCurves] + aExitKnots[4] + fLinkLength, MC_MotionFunctionType.MOTIONFUNCTYPE_POLYNOM5);	// run-down to rest
+END_IF
+AddPoint(fMasterEnd, MC_MotionFunctionType.MOTIONFUNCTYPE_POLYNOM1);
+
+IF NOT bError THEN
+	pPoints[nPoints - 1].RelIndexNextPoint := 0;	// terminate the table
+END_IF
+Build := NOT bError;]]></ST>
+      </Implementation>
+    </Method>
+    <Method Name="InvBallArc" Id="{31b59390-af40-4b73-af0c-a9c7121ceb99}">
+      <Declaration><![CDATA[METHOD PRIVATE InvBallArc : LREAL
+(* mover position for a ball path length: Newton iteration on B(s) = fB *)
+VAR_INPUT
+	fB	: LREAL;
+END_VAR
+VAR
+	fS, fF	: LREAL;
+	i		: UINT;
+END_VAR]]></Declaration>
+      <Implementation>
+        <ST><![CDATA[fS := fB;
+FOR i := 1 TO 50 DO
+	fF := BallArc(fS) - fB;
+	IF ABS(fF) < 1.0E-9 THEN EXIT; END_IF
+	fS := fS - fF / (1.0 + fBallOffset * Kappa(fS));
+END_FOR
+InvBallArc := fS;]]></ST>
+      </Implementation>
+    </Method>
+    <Method Name="Kappa" Id="{93766d7e-f62d-474c-ad2b-a5c93d0140f7}">
+      <Declaration><![CDATA[METHOD PRIVATE Kappa : LREAL
+(* curvature [1/mm] of the mover path at fS *)
+VAR_INPUT
+	fS	: LREAL;
+END_VAR
+VAR
+	i	: UINT;
+END_VAR]]></Declaration>
+      <Implementation>
+        <ST><![CDATA[Kappa := 0.0;
+FOR i := 1 TO nCurves DO
+	Kappa := Kappa + KappaMod(fS - aCurveStart[i]);
+END_FOR]]></ST>
+      </Implementation>
+    </Method>
+    <Method Name="KappaMod" Id="{0db579bb-e0bc-42ff-88c0-61d5ea004ec0}">
+      <Declaration><![CDATA[METHOD PRIVATE KappaMod : LREAL
+(* curvature inside one 180 deg module, fU = position from module start.
+   Quintic ramp k = kmax * (10 t^3 - 15 t^4 + 6 t^5), t = u / L_trans; circular middle; mirrored ramp *)
+VAR_INPUT
+	fU	: LREAL;
+END_VAR
+VAR
+	t	: LREAL;
+END_VAR]]></Declaration>
+      <Implementation>
+        <ST><![CDATA[IF fU <= 0.0 OR fU >= fModuleLength THEN
+	KappaMod := 0.0;
+ELSIF fU < fTransLength THEN
+	t := fU / fTransLength;
+	KappaMod := fKMax * t * t * t * (10.0 - 15.0 * t + 6.0 * t * t);
+ELSIF fU <= fModuleLength - fTransLength THEN
+	KappaMod := fKMax;
+ELSE
+	t := (fModuleLength - fU) / fTransLength;
+	KappaMod := fKMax * t * t * t * (10.0 - 15.0 * t + 6.0 * t * t);
+END_IF]]></ST>
+      </Implementation>
+    </Method>
+    <Method Name="SlavePos" Id="{de3d35fb-fa63-4e4f-8023-3257f30279a6}">
+      <Declaration><![CDATA[METHOD SlavePos : LREAL
+(* exact slave position for a master position: constant distance fBallDistance along the ball path *)
+VAR_INPUT
+	fMaster	: LREAL;
+END_VAR]]></Declaration>
+      <Implementation>
+        <ST><![CDATA[SlavePos := InvBallArc(BallArc(fMaster) - fBallDistance);]]></ST>
+      </Implementation>
+    </Method>
+    <Method Name="SpeedRatio" Id="{1cba1dfd-451a-41ab-ae62-b72a3e1cc447}">
+      <Declaration><![CDATA[METHOD SpeedRatio : LREAL
+(* exact slave/master speed ratio ds/dm for a master position (diagnostics) *)
+VAR_INPUT
+	fMaster	: LREAL;
+END_VAR]]></Declaration>
+      <Implementation>
+        <ST><![CDATA[SpeedRatio := (1.0 + fBallOffset * Kappa(fMaster)) / (1.0 + fBallOffset * Kappa(SlavePos(fMaster)));]]></ST>
+      </Implementation>
+    </Method>
+    <Method Name="Theta" Id="{fb735bfe-8860-4753-ad44-680d9dc8e121}">
+      <Declaration><![CDATA[METHOD PRIVATE Theta : LREAL
+(* heading angle [rad] turned between fMasterStart and fS (sum over the modules; table covers one lap) *)
+VAR_INPUT
+	fS	: LREAL;
+END_VAR
+VAR
+	i	: UINT;
+END_VAR]]></Declaration>
+      <Implementation>
+        <ST><![CDATA[Theta := 0.0;
+FOR i := 1 TO nCurves DO
+	Theta := Theta + ThetaMod(fS - aCurveStart[i]);
+END_FOR]]></ST>
+      </Implementation>
+    </Method>
+    <Method Name="ThetaMod" Id="{cfb2ed0c-14c3-4956-8fe2-ae215687c617}">
+      <Declaration><![CDATA[METHOD PRIVATE ThetaMod : LREAL
+(* heading [rad] turned inside one module up to fU (closed-form integral of KappaMod):
+   ramp: kmax * L_trans * (2.5 t^4 - 3 t^5 + t^6); a full ramp turns kmax * L_trans / 2 *)
+VAR_INPUT
+	fU	: LREAL;
+END_VAR
+VAR
+	t	: LREAL;
+END_VAR]]></Declaration>
+      <Implementation>
+        <ST><![CDATA[IF fU <= 0.0 THEN
+	ThetaMod := 0.0;
+ELSIF fU >= fModuleLength THEN
+	ThetaMod := fPI;
+ELSIF fU < fTransLength THEN
+	t := fU / fTransLength;
+	ThetaMod := fKMax * fTransLength * t * t * t * t * (2.5 - 3.0 * t + t * t);
+ELSIF fU <= fModuleLength - fTransLength THEN
+	ThetaMod := 0.5 * fKMax * fTransLength + fKMax * (fU - fTransLength);
+ELSE
+	t := (fModuleLength - fU) / fTransLength;
+	ThetaMod := fPI - fKMax * fTransLength * t * t * t * t * (2.5 - 3.0 * t + t * t);
+END_IF]]></ST>
+      </Implementation>
+    </Method>
+  </POU>
+</TcPlcObject>

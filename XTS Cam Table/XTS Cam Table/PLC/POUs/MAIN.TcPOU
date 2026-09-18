@@ -4,14 +4,18 @@
     <Declaration><![CDATA[// XTS cam table demo - as simple as it gets.
 //
 //   Mover 1 = master, runs at constant velocity around the track.
-//   Mover 2 = slave, follows Mover 1 through ONE cam table that covers one full lap (0..1500 mm).
+//   Mover 2 = slave, follows Mover 1 through ONE cam table that covers one full lap (1500 mm).
 //
-//   Straights (0..250, 750..1000):    Mover 2 is 100 mm behind Mover 1, 1:1.
-//   Curves    (250..750, 1000..1500): Mover 2 is  60 mm behind Mover 1, 1:1.
-//   At the start of every section the gap blends smoothly over TRANSITION mm of master travel.
+// Two example tables. Pick one with eExample BEFORE bStart:
 //
-// How to run (online view):  bStart -> watch eState -> bStop.   On Error: bReset.
-// Watch fGapActual against the table while it runs.
+//   ConstantGap      9 points. Mover 2 is 100 mm behind Mover 1 on the straights and 60 mm in the curves,
+//                    blended over TRANSITION mm at the start of every section.   -> BuildTable_ConstantGap
+//   ClothoidBallGap  18 points from FB_XtsBallCamBuilder. Each mover carries a "ball" BALL_OFFSET mm outboard
+//                    of the track. The table keeps the two balls BALL_DISTANCE mm apart along the ball path,
+//                    so Mover 2 speeds up going into a curve and slows down coming out.  -> BuildTable_Clothoid
+//
+// How to run (online view):  eExample -> bStart -> watch eState -> bStop.   On Error: bReset.
+// Watch fGapActual while it runs.
 PROGRAM MAIN
 VAR CONSTANT
 	// --- track geometry (mm) ---
@@ -20,32 +24,46 @@ VAR CONSTANT
 	CURVE_1_START			: LREAL := 250.0;
 	STRAIGHT_2_START		: LREAL := 750.0;
 	CURVE_2_START			: LREAL := 1000.0;
+	MODULE_LENGTH			: LREAL := 500.0;	// one 180 deg curve module (AT2050)
 
-	// --- wanted distance Mover 1 -> Mover 2 (mm, Mover 2 runs BEHIND Mover 1) ---
+	// --- ConstantGap: wanted distance Mover 1 -> Mover 2 (mm, Mover 2 runs BEHIND Mover 1) ---
 	GAP_STRAIGHT			: LREAL := 100.0;
 	GAP_CURVE				: LREAL := 60.0;
 	TRANSITION				: LREAL := 100.0;	// master travel over which the gap blends to the new value
+
+	// --- ClothoidBallGap ---
+	BALL_DISTANCE			: LREAL := 115.0;	// mm between the two balls, measured along the ball path
+	BALL_OFFSET				: LREAL := 103.03;	// mm the ball sits outboard of the mover path
+	CLOTHOID_TABLE_START	: LREAL := 180.0;	// master position of the first table point. Any point on straight 1
+												// that keeps every ramp clear of the 1500 -> 0 wrap works (103 < x < 266).
 
 	// --- demo dynamics ---
 	MASTER_VELOCITY			: LREAL := 300.0;	// mm/s, Mover 1 while running
 	POSITIONING_VELOCITY	: LREAL := 200.0;	// mm/s, Mover 2 while pre-positioning
 
 	CAM_TABLE_ID			: MC_CAM_ID := 1;	// NC > Tables > Master 1 > Slave 1
+	MAX_CAM_POINTS			: UDINT := 32;		// room for either table
+	TABLE_BUILD_ERROR_ID	: UDINT := 16#FFFF_FFFF;	// not an NC error: the PLC-side builder refused, see sTableError
 END_VAR
 VAR
 	// --- commands: set TRUE in the online view, they reset themselves ---
+	eExample			: E_Example := E_Example.ConstantGap;	// which table to build - change while Idle
 	bStart				: BOOL;
 	bStop				: BOOL;
 	bReset				: BOOL;
 	eState				: E_State;
+	eExampleActive		: E_Example;	// the example the current table was built for (latched at bStart)
 
 	// --- axes (linked to NC axes "Mover Axis 1" / "Mover Axis 2") ---
 	Mover1				: AXIS_REF;		// master
 	Mover2				: AXIS_REF;		// slave
 
-	// --- cam table data: 9 points, loaded into NC table CAM_TABLE_ID ---
-	aCamPoints			: ARRAY[1..9] OF MC_MotionFunctionPoint;
+	// --- cam table data: nCamPoints points, loaded into NC table CAM_TABLE_ID ---
+	aCamPoints			: ARRAY[1..MAX_CAM_POINTS] OF MC_MotionFunctionPoint;
+	nCamPoints			: UDINT;		// points actually used (9 or 18)
+	fTableMasterStart	: LREAL;		// master position of the first table point (0 or CLOTHOID_TABLE_START)
 	stCamTable			: MC_CAM_REF;
+	fbClothoidBuilder	: FB_XtsBallCamBuilder;	// computes the ClothoidBallGap points
 
 	// --- function blocks ---
 	fbPowerMover1		: MC_Power;
@@ -63,10 +81,12 @@ VAR
 	// --- live values worth watching ---
 	fMover1Pos			: LREAL;	// modulo set position of Mover 1 (0..1500)
 	fMover2Pos			: LREAL;	// modulo set position of Mover 2 (0..1500)
-	fGapActual			: LREAL;	// how far Mover 2 is behind Mover 1 right now
+	fGapActual			: LREAL;	// how far Mover 2 is behind Mover 1 right now (along the track)
 	fGapWanted			: LREAL;	// what the table asked for at coupling time
+	fMasterInTable		: LREAL;	// fMover1Pos mapped into the master range of the table
 	bError				: BOOL;
 	nErrorID			: UDINT;
+	sTableError			: STRING(255);	// why the ClothoidBallGap builder refused (nErrorID = TABLE_BUILD_ERROR_ID)
 END_VAR
 ]]></Declaration>
     <Implementation>
@@ -101,29 +121,37 @@ CASE eState OF
 		END_IF
 
 	E_State.BuildTable:
-		// fill the point array once, then hand it to the NC (overwrites cam table CAM_TABLE_ID)
+		// fill the point array once for the selected example, then hand it to the NC (overwrites cam table CAM_TABLE_ID)
 		IF NOT fbCamTableSelect.Execute THEN
 			BuildCamTable();
 		END_IF
-		fbCamTableSelect.Periodic := TRUE;		// one table = one lap, repeat forever
-		fbCamTableSelect.CamTableID := CAM_TABLE_ID;
-		fbCamTableSelect.Execute := TRUE;
-		IF fbCamTableSelect.Done THEN
-			fbCamTableSelect.Execute := FALSE;
-			eState := E_State.ReadTable;
+		IF nCamPoints > 0 THEN		// = 0: the builder refused, the error check below picks up sTableError
+			fbCamTableSelect.Periodic := TRUE;		// one table = one lap, repeat forever
+			fbCamTableSelect.CamTableID := CAM_TABLE_ID;
+			fbCamTableSelect.Execute := TRUE;
+			IF fbCamTableSelect.Done THEN
+				fbCamTableSelect.Execute := FALSE;
+				eState := E_State.ReadTable;
+			END_IF
 		END_IF
 
 	E_State.ReadTable:
 		// Mover 1 stays where it is. Ask the NC what slave position the table wants for it.
+		// The table master runs from fTableMasterStart to fTableMasterStart + 1500, so a track position
+		// below the table start is one lap further on in the table.
 		IF NOT fbReadTable.Execute THEN
+			fMasterInTable := fMover1Pos;
+			IF fMasterInTable < fTableMasterStart THEN
+				fMasterInTable := fMasterInTable + TRACK_LENGTH;
+			END_IF
 			fbReadTable.CamTableID := CAM_TABLE_ID;
-			fbReadTable.MasterPosition := fMover1Pos;
+			fbReadTable.MasterPosition := fMasterInTable;
 		END_IF
 		fbReadTable.Execute := TRUE;
 		IF fbReadTable.Done THEN
 			fbReadTable.Execute := FALSE;
 			// table: slave = master - gap   ->   gap = master - slave
-			fGapWanted := fMover1Pos - fbReadTable.SlavePosition;
+			fGapWanted := fMasterInTable - fbReadTable.SlavePosition;
 			// Mover 1 stands still, so this relative move can never run into it:
 			// positive = Mover 2 closes up from behind, negative = Mover 2 backs off a little
 			fbMoveRelMover2.Distance := fGapActual - fGapWanted;
@@ -140,7 +168,7 @@ CASE eState OF
 
 	E_State.CamIn:
 		fbCamIn.CamTableID := CAM_TABLE_ID;
-		fbCamIn.StartMode := MC_STARTMODE_ABSOLUTE;		// table master axis = Mover 1 track position (0..1500)
+		fbCamIn.StartMode := MC_STARTMODE_ABSOLUTE;		// table master axis = Mover 1 track position
 		fbCamIn.MasterOffset := 0.0;
 		fbCamIn.SlaveOffset := 0.0;
 		fbCamIn.MasterScaling := 1.0;
@@ -200,6 +228,7 @@ CASE eState OF
 			fbResetMover2.Execute := FALSE;
 			bError := FALSE;
 			nErrorID := 0;
+			sTableError := '';
 			eState := E_State.Idle;
 		END_IF
 END_CASE
@@ -214,6 +243,8 @@ IF eState <> E_State.Error AND eState <> E_State.Resetting THEN
 		nErrorID := fbPowerMover1.ErrorID;
 	ELSIF fbPowerMover2.Error THEN
 		nErrorID := fbPowerMover2.ErrorID;
+	ELSIF sTableError <> '' THEN
+		nErrorID := TABLE_BUILD_ERROR_ID;
 	ELSIF fbCamTableSelect.Error THEN
 		nErrorID := fbCamTableSelect.ErrorID;
 	ELSIF fbReadTable.Error THEN
@@ -251,6 +282,67 @@ fbCamOut(Slave := Mover2);
     </Implementation>
     <Action Name="BuildCamTable" Id="{3fc013df-affb-4578-8438-38db55ca5552}">
       <Implementation>
+        <ST><![CDATA[// Builds the table selected with eExample into aCamPoints / nCamPoints and describes it to the NC.
+// nCamPoints = 0 (with sTableError set) means the builder refused.
+eExampleActive := eExample;
+sTableError := '';
+nCamPoints := 0;
+
+CASE eExampleActive OF
+	E_Example.ConstantGap:		BuildTable_ConstantGap();
+	E_Example.ClothoidBallGap:	BuildTable_Clothoid();
+END_CASE
+
+// describe the array to the NC
+stCamTable.pArray		:= ADR(aCamPoints);
+stCamTable.ArraySize	:= nCamPoints * SIZEOF(MC_MotionFunctionPoint);
+stCamTable.TableType	:= MC_TABLETYPE_MOTIONFUNCTION;
+stCamTable.NoOfRows		:= nCamPoints;
+stCamTable.NoOfColumns	:= 1;
+]]></ST>
+      </Implementation>
+    </Action>
+    <Action Name="BuildTable_Clothoid" Id="{2a5e1418-1bb6-43f2-bdf0-2240d29c3f40}">
+      <Implementation>
+        <ST><![CDATA[// One lap of Mover 1 (CLOTHOID_TABLE_START .. +1500) -> where Mover 2 has to be so that the two balls
+// stay BALL_DISTANCE apart along the ball path.
+//
+// FB_XtsBallCamBuilder does the geometry. The AT2050 curve module is not a plain half circle: its curvature
+// ramps up over a short transition (a clothoid-like quintic), holds, and ramps down again. A ball sitting
+// BALL_OFFSET mm outboard of the track therefore travels further than the mover while the track is bending,
+// so for the balls to keep their distance the slave has to run faster than the master going into a curve
+// and slower coming out. The builder writes 8 points per curve (ramp / plateau / ramp / line at the entry,
+// mirrored at the exit) plus one point at each end of the table. See the FB header for the knot layout.
+//
+// Table master range 180..1680 instead of 0..1500: every ramp then lies inside the table and none of them
+// straddles the 1500 -> 0 wrap of the track. The NC handles the lap mapping because the table is periodic.
+fbClothoidBuilder.fMasterStart		:= CLOTHOID_TABLE_START;
+fbClothoidBuilder.fMasterEnd		:= CLOTHOID_TABLE_START + TRACK_LENGTH;
+fbClothoidBuilder.fBallDistance		:= BALL_DISTANCE;
+fbClothoidBuilder.fBallOffset		:= BALL_OFFSET;
+fbClothoidBuilder.nCurves			:= 2;
+fbClothoidBuilder.aCurveStart[1]	:= CURVE_1_START;
+fbClothoidBuilder.aCurveStart[2]	:= CURVE_2_START;
+fbClothoidBuilder.fModuleLength		:= MODULE_LENGTH;
+// fTransLength, aEntryKnots, aExitKnots keep the FB defaults (tuned for 115 mm / 103 mm on AT2050 modules)
+fbClothoidBuilder.pPoints			:= ADR(aCamPoints);
+fbClothoidBuilder.nMaxPoints		:= MAX_CAM_POINTS;
+
+IF fbClothoidBuilder.Build() THEN
+	nCamPoints := fbClothoidBuilder.nPoints;		// 18 (the builder terminates the last point itself)
+	fTableMasterStart := CLOTHOID_TABLE_START;
+ELSE
+	nCamPoints := 0;
+	sTableError := fbClothoidBuilder.sError;
+END_IF
+
+// Slave goes from 65 (master 180) to 1565 (master 1680) = +1500 per lap, same "cyclic cam with lift"
+// as the ConstantGap table, so Mover 2 keeps going around with Mover 1.
+]]></ST>
+      </Implementation>
+    </Action>
+    <Action Name="BuildTable_ConstantGap" Id="{bb0e9638-0b15-4592-a644-6d144105f0a1}">
+      <Implementation>
         <ST><![CDATA[// One lap of Mover 1 (0..1500) -> where Mover 2 has to be (master minus gap).
 // Every section starts with a TRANSITION where the gap blends to the new value, then runs 1:1.
 // The curve type on a point is used from that point to the NEXT point.
@@ -267,15 +359,11 @@ aCamPoints[8] := F_CamPoint(8,   CURVE_2_START + TRANSITION,    GAP_CURVE,    MO
 aCamPoints[9] := F_CamPoint(9,   TRACK_LENGTH,                  GAP_CURVE,    MOTIONFUNCTYPE_POLYNOM1);		// 1500: end of lap, same gap as point 1
 aCamPoints[9].RelIndexNextPoint := 0;	// last point has no successor
 
+nCamPoints := 9;
+fTableMasterStart := STRAIGHT_1_START;
+
 // Slave goes from -60 (point 1) to 1440 (point 9) = +1500 per lap. The NC calls this a "cyclic cam
 // with lift" and simply keeps adding 1500 every lap, so Mover 2 keeps going around with Mover 1.
-
-// describe the array to the NC
-stCamTable.pArray		:= ADR(aCamPoints);
-stCamTable.ArraySize	:= SIZEOF(aCamPoints);
-stCamTable.TableType	:= MC_TABLETYPE_MOTIONFUNCTION;
-stCamTable.NoOfRows		:= 9;
-stCamTable.NoOfColumns	:= 1;
 ]]></ST>
       </Implementation>
     </Action>
